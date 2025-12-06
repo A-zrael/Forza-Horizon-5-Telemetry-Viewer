@@ -9,6 +9,7 @@ type Sample struct {
 	VelX     float64
 	VelY     float64
 	VelZ     float64
+	IsRaceOn int
 	SpeedMPH float64
 	SpeedKMH float64
 	Gear     int

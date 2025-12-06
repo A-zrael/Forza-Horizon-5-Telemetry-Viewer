@@ -41,10 +41,26 @@ func DetectEvents(samples []models.Sample) []models.Event {
 
 	resetStart := -1
 	resetAccum := 0.0
+	seenOn := false
 
 	for i := 1; i < len(samples); i++ {
 		prev := samples[i-1]
 		cur := samples[i]
+
+		// Wait until race actually starts; ignore pre-race zeros.
+		if cur.IsRaceOn == 0 && !seenOn {
+			continue
+		}
+		if cur.IsRaceOn != 0 {
+			seenOn = true
+		} else if seenOn {
+			// Once we've seen on-state, stop when it goes back to zero (post-race).
+			break
+		}
+		// If previous sample was off, skip this transition frame.
+		if prev.IsRaceOn == 0 {
+			continue
+		}
 
 		dt := cur.Time - prev.Time
 		if dt <= 0 || dt > 1.0 || math.IsNaN(dt) || math.IsInf(dt, 0) {

@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -155,6 +156,7 @@ func main() {
 		DistanceSq float64 `json:"distanceSq,omitempty"`
 	}
 	type carPoint struct {
+		Time     float64 `json:"time"`
 		Lap      int     `json:"lap"`
 		Heading  float64 `json:"heading"`
 		MasterX  float64 `json:"masterX"`
@@ -184,6 +186,16 @@ func main() {
 
 	for _, sess := range sessions {
 		cOut := carOut{Source: sess.path}
+
+		if len(sess.samples) > 0 {
+			// Normalize event times to session start so they align with point times.
+			for i := range sess.events {
+				sess.events[i].Time -= sess.samples[0].Time
+				if sess.events[i].Time < 0 {
+					sess.events[i].Time = 0
+				}
+			}
+		}
 		// Lap times with embedded sector splits (3 sectors by default).
 		cOut.LapTimes = track.ComputeLapMetrics(sess.samples, sess.track, sess.lapIdx, 3)
 		for lapNum := 1; lapNum < len(sess.lapIdx); lapNum++ {
@@ -196,6 +208,7 @@ func main() {
 			track.MapToMaster(segment, masterTrack, start, func(idx int, relS, x, y float64, mi int, mRelS, mx, my, dist float64) {
 				var heading, speedMPH, speedKMH float64
 				var gear int
+				var t float64
 				if idx >= 0 && idx < len(sess.track) {
 					heading = sess.track[idx].Theta
 				}
@@ -203,8 +216,10 @@ func main() {
 					speedMPH = sess.samples[idx].SpeedMPH
 					speedKMH = sess.samples[idx].SpeedKMH
 					gear = sess.samples[idx].Gear
+					t = sess.samples[idx].Time - sess.samples[0].Time
 				}
 				cOut.Points = append(cOut.Points, carPoint{
+					Time:     t,
 					Lap:      lapNum,
 					Heading:  heading,
 					MasterX:  mx,
@@ -242,6 +257,11 @@ func main() {
 
 		out.Cars = append(out.Cars, cOut)
 	}
+
+	// Sort events by time to make the viewer list ordered.
+	sort.Slice(out.Events, func(i, j int) bool {
+		return out.Events[i].Time < out.Events[j].Time
+	})
 
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
@@ -355,6 +375,18 @@ func LoadSamplesFromCSV(path string) ([]models.Sample, error) {
 		if idx, ok := cols["gear"]; ok {
 			gear = int(parseOrZero(row[idx]))
 		}
+		isRaceOn := 1
+		if idx, ok := cols["israceon"]; ok {
+			val := strings.TrimSpace(strings.ToLower(row[idx]))
+			switch val {
+			case "true", "1", "yes", "on":
+				isRaceOn = 1
+			case "false", "0", "no", "off":
+				isRaceOn = 0
+			default:
+				isRaceOn = int(parseOrZero(row[idx]))
+			}
+		}
 
 		samples = append(samples, models.Sample{
 			Time:     timeSec,
@@ -365,6 +397,7 @@ func LoadSamplesFromCSV(path string) ([]models.Sample, error) {
 			VelX:     vx,
 			VelY:     vy,
 			VelZ:     vz,
+			IsRaceOn: isRaceOn,
 			SpeedMPH: speedMPH,
 			SpeedKMH: speedKMH,
 			Gear:     gear,
