@@ -35,8 +35,14 @@ func main() {
 		inputFiles = append(inputFiles, filesFromFolders(folderPaths)...)
 	}
 	if len(inputFiles) == 0 {
-		inputFiles = append(inputFiles, "mockdata/gol1/Car-5030.csv")
+		if len(filePaths) == 0 && len(folderPaths) == 0 {
+			inputFiles = append(inputFiles, "mockdata/gol1/Car-5030.csv")
+		} else {
+			fmt.Fprintf(os.Stderr, "no CSV files found for provided -file/-folder args\n")
+			os.Exit(1)
+		}
 	}
+	fmt.Fprintf(os.Stderr, "input files: %d\n", len(inputFiles))
 
 	var (
 		allPoints   []models.Trackpoint
@@ -294,7 +300,7 @@ func filesFromFolders(folders []string) []string {
 			if d.IsDir() {
 				return nil
 			}
-			if strings.HasSuffix(strings.ToLower(d.Name()), ".csv") {
+			if strings.EqualFold(filepath.Ext(d.Name()), ".csv") {
 				if _, ok := seen[path]; !ok {
 					out = append(out, path)
 					seen[path] = struct{}{}
