@@ -193,7 +193,9 @@ func main() {
 	}
 
 	for _, sess := range sessions {
-		cOut := carOut{Source: sess.path}
+		base := filepath.Base(sess.path)
+		sourceName := strings.TrimSuffix(base, filepath.Ext(base))
+		cOut := carOut{Source: sourceName}
 
 		if len(sess.samples) > 0 {
 			// Normalize event times to session start so they align with point times.
@@ -248,7 +250,7 @@ func main() {
 			mi, mRelS, mx, my, dist := track.MapRelSToMaster(masterTrack, relS, px, py)
 			eo := eventOut{
 				Type:       ev.Type,
-				Source:     sess.path,
+				Source:     sourceName,
 				Index:      ev.Index,
 				Time:       ev.Time,
 				Note:       ev.Note,
