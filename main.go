@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"forza/models"
 	"forza/track"
+	"io"
 	"io/fs"
+	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -27,6 +30,9 @@ func main() {
 	minLapSpacing := flag.Float64("min-lap-spacing", 200, "Minimum distance (m) between lap boundaries when using distance-based detection")
 	masterSamples := flag.Int("master-samples", 2000, "Resampled points per lap when building master lap")
 	useMaster := flag.Bool("use-master", true, "If true, output the averaged master lap instead of per-lap raw points")
+	outPath := flag.String("out", "", "Write JSON to file instead of stdout; implied web/data.json when -serve is set")
+	serve := flag.Bool("serve", true, "Generate JSON then serve the viewer locally")
+	addr := flag.String("addr", ":8080", "Listen address when -serve is enabled")
 	flag.Parse()
 
 	// Collect input files from flags
@@ -265,12 +271,42 @@ func main() {
 		return out.Events[i].Time < out.Events[j].Time
 	})
 
-	enc := json.NewEncoder(os.Stdout)
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(out); err != nil {
 		fmt.Fprintf(os.Stderr, "error encoding json: %v\n", err)
 		os.Exit(1)
 	}
+
+	// Output handling
+	if *serve {
+		target := *outPath
+		if target == "" {
+			target = filepath.Join("web", "data.json")
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "error creating output dir: %v\n", err)
+			os.Exit(1)
+		}
+		if err := os.WriteFile(target, []byte(buf.String()), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "error writing %s: %v\n", target, err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "wrote %s (%d bytes)\n", target, len(buf.String()))
+		serveViewer(*addr, "web", target)
+		return
+	}
+
+	if *outPath != "" {
+		if err := os.WriteFile(*outPath, []byte(buf.String()), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "error writing %s: %v\n", *outPath, err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	io.WriteString(os.Stdout, buf.String())
 }
 
 type sessionResult struct {
@@ -306,6 +342,18 @@ func filesFromFolders(folders []string) []string {
 		})
 	}
 	return out
+}
+
+func serveViewer(addr, webDir, dataPath string) {
+	absWeb, _ := filepath.Abs(webDir)
+	absData, _ := filepath.Abs(dataPath)
+	http.HandleFunc("/data.json", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, absData)
+	})
+	fs := http.FileServer(http.Dir(absWeb))
+	http.Handle("/", fs)
+	fmt.Fprintf(os.Stderr, "serving %s and %s at http://localhost%s\n", absWeb, absData, addr)
+	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
 func LoadSamplesFromCSV(path string) ([]models.Sample, error) {
