@@ -124,3 +124,158 @@ func okToEmit(lastTime float64, now float64, window float64) bool {
 	}
 	return now-lastTime >= window
 }
+
+// MappedPoint represents a point mapped to master coordinates for cross-car comparisons.
+type MappedPoint struct {
+	Time    float64
+	Lap     int
+	RelS    float64
+	MasterX float64
+	MasterY float64
+}
+
+type OvertakeEvent struct {
+	Source  string
+	Target  string
+	Time    float64
+	Lap     int
+	RelS    float64
+	MasterX float64
+	MasterY float64
+}
+
+// DetectOvertakes finds overtake events between cars using their mapped points.
+// Input map keys are source names; values are ordered slices of points.
+func DetectOvertakes(mapped map[string][]MappedPoint) []OvertakeEvent {
+	var events []OvertakeEvent
+	for aName, aPts := range mapped {
+		for bName, bPts := range mapped {
+			if aName >= bName {
+				continue
+			}
+			evs := detectPair(aName, bName, aPts, bPts)
+			events = append(events, evs...)
+		}
+	}
+	return events
+}
+
+func detectPair(aName, bName string, aPts, bPts []MappedPoint) []OvertakeEvent {
+	var out []OvertakeEvent
+	if len(aPts) == 0 || len(bPts) == 0 {
+		return out
+	}
+	lapA := lapLengthsFromMapped(aPts)
+	lapB := lapLengthsFromMapped(bPts)
+	maxT := aPts[len(aPts)-1].Time
+	if bPts[len(bPts)-1].Time < maxT {
+		maxT = bPts[len(bPts)-1].Time
+	}
+
+	ia, ib := 0, 0
+	prevAhead := 0
+	for ia < len(aPts) && ib < len(bPts) {
+		t := aPts[ia].Time
+		if bPts[ib].Time < t {
+			t = bPts[ib].Time
+		}
+		if t > maxT {
+			break
+		}
+		pa, oka := pointAtTimeMapped(aPts, t)
+		pb, okb := pointAtTimeMapped(bPts, t)
+		if !oka || !okb {
+			break
+		}
+		progA := progressMapped(pa, lapA)
+		progB := progressMapped(pb, lapB)
+		ahead := 0
+		if progA > progB {
+			ahead = 1
+		} else if progB > progA {
+			ahead = -1
+		}
+		if prevAhead != 0 && ahead != 0 && ahead != prevAhead {
+			if ahead > 0 {
+				out = append(out, OvertakeEvent{
+					Source:  aName,
+					Target:  bName,
+					Time:    t,
+					Lap:     pa.Lap,
+					RelS:    pa.RelS,
+					MasterX: pa.MasterX,
+					MasterY: pa.MasterY,
+				})
+			} else {
+				out = append(out, OvertakeEvent{
+					Source:  bName,
+					Target:  aName,
+					Time:    t,
+					Lap:     pb.Lap,
+					RelS:    pb.RelS,
+					MasterX: pb.MasterX,
+					MasterY: pb.MasterY,
+				})
+			}
+		}
+		prevAhead = ahead
+		if ia+1 < len(aPts) && (ib+1 >= len(bPts) || aPts[ia+1].Time <= bPts[ib+1].Time) {
+			ia++
+		} else {
+			ib++
+		}
+	}
+	return out
+}
+
+func pointAtTimeMapped(points []MappedPoint, t float64) (MappedPoint, bool) {
+	if len(points) == 0 {
+		return MappedPoint{}, false
+	}
+	if t <= points[0].Time {
+		return points[0], true
+	}
+	if t >= points[len(points)-1].Time {
+		return points[len(points)-1], true
+	}
+	lo, hi := 0, len(points)-1
+	for hi-lo > 1 {
+		mid := (hi + lo) >> 1
+		if points[mid].Time <= t {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	p1, p2 := points[lo], points[hi]
+	span := p2.Time - p1.Time
+	if span <= 0 {
+		return p1, true
+	}
+	alpha := (t - p1.Time) / span
+	return MappedPoint{
+		Time:    t,
+		Lap:     p1.Lap,
+		RelS:    p1.RelS + (p2.RelS-p1.RelS)*alpha,
+		MasterX: p1.MasterX + (p2.MasterX-p1.MasterX)*alpha,
+		MasterY: p1.MasterY + (p2.MasterY-p1.MasterY)*alpha,
+	}, true
+}
+
+func lapLengthsFromMapped(points []MappedPoint) map[int]float64 {
+	m := make(map[int]float64)
+	for _, p := range points {
+		if p.RelS > m[p.Lap] {
+			m[p.Lap] = p.RelS
+		}
+	}
+	return m
+}
+
+func progressMapped(p MappedPoint, lapLen map[int]float64) float64 {
+	lenLap := lapLen[p.Lap]
+	if lenLap <= 0 {
+		lenLap = 1
+	}
+	return float64(p.Lap-1) + p.RelS/lenLap
+}

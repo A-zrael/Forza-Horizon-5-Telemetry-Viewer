@@ -24,10 +24,11 @@
       gap: 12px;
       height: 100vh;
       padding: 12px;
+      overflow: hidden;
     }
     #canvas {
       width: 100%;
-      height: 100%;
+      height: calc(100vh - 24px);
       background: var(--panel);
       border-radius: 10px;
       box-shadow: 0 8px 20px rgba(0,0,0,0.35);
@@ -37,6 +38,7 @@
       border-radius: 10px;
       padding: 12px;
       overflow: auto;
+      max-height: calc(100vh - 24px);
       box-shadow: 0 8px 20px rgba(0,0,0,0.35);
     }
     h1 { margin: 0 0 8px; font-size: 18px; }
@@ -58,13 +60,130 @@
       display: inline-block;
       border: 1px solid rgba(0,0,0,0.3);
     }
-    table { width: 100%; border-collapse: collapse; font-size: 12px; margin-bottom: 10px; }
+    table { width: 100%; min-width: 360px; border-collapse: collapse; font-size: 12px; margin-bottom: 10px; }
     th, td { padding: 4px 6px; text-align: right; border-bottom: 1px solid rgba(255,255,255,0.05); }
     th { text-align: left; color: var(--muted); }
     #controls { display: flex; align-items: center; gap: 8px; margin: 6px 0 10px; }
     #controls button { background: var(--accent); color: #000; border: none; padding: 6px 10px; border-radius: 6px; cursor: pointer; }
     #controls input[type=range] { flex: 1; }
     #timeLabel { font-family: monospace; color: var(--muted); }
+    .table-wrap { overflow-x: auto; }
+    #settingsBtn {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 15;
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.1);
+      background: rgba(17,20,29,0.9);
+      color: var(--text);
+      cursor: pointer;
+      box-shadow: 0 8px 20px rgba(0,0,0,0.35);
+    }
+    #settingsOverlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.55);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 20;
+    }
+    #settingsModal {
+      background: #11141d;
+      padding: 16px;
+      border-radius: 10px;
+      width: min(320px, 90vw);
+      box-shadow: 0 12px 30px rgba(0,0,0,0.5);
+      color: var(--text);
+    }
+    #settingsModal h3 { margin: 0 0 10px; }
+    #settingsModal label { display: block; margin: 4px 0; }
+    #settingsModal .actions { margin-top: 12px; text-align: right; }
+    #settingsModal button { padding: 6px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); background: var(--accent); color: #000; cursor: pointer; }
+    #livePanel {
+      position: fixed;
+      top: 12px;
+      right: 12px;
+      width: 260px;
+      background: rgba(17,20,29,0.9);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 10px;
+      box-shadow: 0 8px 20px rgba(0,0,0,0.45);
+      z-index: 10;
+      cursor: grab;
+    }
+    #liveHeader {
+      padding: 6px 10px;
+      font-weight: 600;
+      font-size: 13px;
+      background: rgba(255,255,255,0.03);
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+      border-radius: 10px 10px 0 0;
+    }
+    #live {
+      padding: 6px 10px 10px;
+      font-size: 12px;
+    }
+    .live-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 6px;
+      padding: 2px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+    .live-row:last-child { border-bottom: none; }
+    .speed-bar {
+      position: relative;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 6px;
+      height: 10px;
+      margin-top: 4px;
+      overflow: hidden;
+    }
+    .speed-fill {
+      position: absolute;
+      top: 0; left: 0; bottom: 0;
+      background: linear-gradient(90deg, #5dd39e 0%, #ffb100 60%, #ff6b6b 100%);
+      width: 0%;
+    }
+    .speed-label {
+      display: block;
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+    @media (max-width: 900px) {
+      body {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto auto;
+        height: auto;
+        overflow: auto;
+      }
+      #canvas {
+        height: 50vh;
+        min-height: 50vh;
+      }
+      #sidebar {
+        max-height: none;
+        overflow: visible;
+      }
+      #livePanel {
+        position: sticky;
+        top: 6px;
+        right: unset;
+        left: 6px;
+        width: auto;
+        max-width: calc(100% - 12px);
+        cursor: default;
+      }
+      #settingsBtn {
+        position: sticky;
+        top: 6px;
+      }
+    }
     .delta-pos { color: #5dd39e; }
     .delta-neg { color: #ff6b6b; }
     .event-row { display: flex; align-items: center; gap: 6px; font-size: 12px; margin-bottom: 4px; }
@@ -72,7 +191,24 @@
   </style>
 </head>
 <body>
+  <button id="settingsBtn">Setup</button>
+  <div id="settingsOverlay">
+    <div id="settingsModal">
+      <h3>Setup</h3>
+      <div>
+        <label><input type="radio" name="unit" value="mph" checked /> MPH</label>
+        <label><input type="radio" name="unit" value="kmh" /> KM/H</label>
+      </div>
+      <div class="actions">
+        <button id="settingsClose">Close</button>
+      </div>
+    </div>
+  </div>
   <canvas id="canvas"></canvas>
+  <div id="livePanel">
+    <div id="liveHeader">Live Telemetry</div>
+    <div id="live"></div>
+  </div>
   <div id="sidebar">
     <h1>Forza Lap Viewer</h1>
     <div id="controls">
@@ -82,6 +218,10 @@
     </div>
     <div id="status">Loading data…</div>
     <div id="legend" class="legend"></div>
+    <h2>Lap Delta</h2>
+    <select id="deltaPlayer" style="margin-bottom:6px;width:100%;padding:4px;border-radius:6px;background:#1b1f2c;color:var(--text);border:1px solid rgba(255,255,255,0.1);"></select>
+    <canvas id="delta" height="120" style="width:100%;border-radius:8px;background:rgba(255,255,255,0.03);"></canvas>
+    <div id="deltaInfo" style="margin:4px 0 10px;font-size:12px;color:var(--muted);"></div>
     <h2>Lap &amp; Sector Times</h2>
     <div id="laps"></div>
     <h2>Events</h2>

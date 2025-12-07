@@ -19,6 +19,57 @@ import (
 	"sync"
 )
 
+type masterOut struct {
+	RelS    float64 `json:"relS"`
+	X       float64 `json:"x"`
+	Y       float64 `json:"y"`
+	Surface string  `json:"surface,omitempty"`
+}
+
+type heatOut struct {
+	Index    int     `json:"index"`
+	RelS     float64 `json:"relS"`
+	X        float64 `json:"x"`
+	Y        float64 `json:"y"`
+	AvgAccel float64 `json:"avgAccel"`
+	Surface  string  `json:"surface,omitempty"`
+}
+
+type eventOut struct {
+	Type       string  `json:"type"`
+	Source     string  `json:"source"`
+	Target     string  `json:"target,omitempty"`
+	Index      int     `json:"index"`
+	Time       float64 `json:"time"`
+	Note       string  `json:"note"`
+	Lap        int     `json:"lap,omitempty"`
+	RelS       float64 `json:"relS,omitempty"`
+	MasterIdx  int     `json:"masterIdx,omitempty"`
+	MasterRelS float64 `json:"masterRelS,omitempty"`
+	MasterX    float64 `json:"masterX,omitempty"`
+	MasterY    float64 `json:"masterY,omitempty"`
+	DistanceSq float64 `json:"distanceSq,omitempty"`
+}
+
+type carPoint struct {
+	Time     float64 `json:"time"`
+	Lap      int     `json:"lap"`
+	RelS     float64 `json:"relS"`
+	Heading  float64 `json:"heading"`
+	MasterX  float64 `json:"masterX"`
+	MasterY  float64 `json:"masterY"`
+	SpeedMPH float64 `json:"speedMPH"`
+	SpeedKMH float64 `json:"speedKMH"`
+	Gear     int     `json:"gear"`
+	Delta    float64 `json:"delta,omitempty"`
+}
+
+type carOut struct {
+	Source   string             `json:"source"`
+	Points   []carPoint         `json:"points,omitempty"`
+	LapTimes []track.LapMetrics `json:"lapTimes,omitempty"`
+}
+
 func main() {
 	var filePaths multiFlag
 	flag.Var(&filePaths, "file", "Path to telemetry CSV file (repeatable)")
@@ -144,44 +195,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	type masterOut struct {
-		RelS float64 `json:"relS"`
-		X    float64 `json:"x"`
-		Y    float64 `json:"y"`
-	}
-	type eventOut struct {
-		Type       string  `json:"type"`
-		Source     string  `json:"source"`
-		Index      int     `json:"index"`
-		Time       float64 `json:"time"`
-		Note       string  `json:"note"`
-		Lap        int     `json:"lap,omitempty"`
-		RelS       float64 `json:"relS,omitempty"`
-		MasterIdx  int     `json:"masterIdx,omitempty"`
-		MasterRelS float64 `json:"masterRelS,omitempty"`
-		MasterX    float64 `json:"masterX,omitempty"`
-		MasterY    float64 `json:"masterY,omitempty"`
-		DistanceSq float64 `json:"distanceSq,omitempty"`
-	}
-	type carPoint struct {
-		Time     float64 `json:"time"`
-		Lap      int     `json:"lap"`
-		Heading  float64 `json:"heading"`
-		MasterX  float64 `json:"masterX"`
-		MasterY  float64 `json:"masterY"`
-		SpeedMPH float64 `json:"speedMPH"`
-		SpeedKMH float64 `json:"speedKMH"`
-		Gear     int     `json:"gear"`
-	}
-	type carOut struct {
-		Source   string             `json:"source"`
-		Points   []carPoint         `json:"points,omitempty"`
-		LapTimes []track.LapMetrics `json:"lapTimes,omitempty"`
-	}
 	out := struct {
-		Master []masterOut `json:"master"`
-		Events []eventOut  `json:"events,omitempty"`
-		Cars   []carOut    `json:"cars,omitempty"`
+		Master  []masterOut `json:"master"`
+		Heatmap []heatOut   `json:"heatmap,omitempty"`
+		Events  []eventOut  `json:"events,omitempty"`
+		Cars    []carOut    `json:"cars,omitempty"`
 	}{}
 
 	for _, p := range masterTrack {
@@ -192,10 +210,26 @@ func main() {
 		})
 	}
 
+	sumSpeed := make([]float64, len(masterTrack))
+	countSpeed := make([]int, len(masterTrack))
+	sumAccel := make([]float64, len(masterTrack))
+	countAccel := make([]int, len(masterTrack))
+	mapped := make(map[string][]track.MappedPoint)
+	surfaceCounts := make([]map[string]int, len(masterTrack))
+	for i := range surfaceCounts {
+		surfaceCounts[i] = make(map[string]int)
+	}
+
 	for _, sess := range sessions {
 		base := filepath.Base(sess.path)
 		sourceName := strings.TrimSuffix(base, filepath.Ext(base))
 		cOut := carOut{Source: sourceName}
+
+		lapStartTime := make(map[int]float64)
+		lapLength := make(map[int]float64)
+		lapDeltaOffset := make(map[int]float64)
+		surfaceLabels := track.ClassifySurface(sess.samples, sess.track, 30)
+		lastSurface := ""
 
 		if len(sess.samples) > 0 {
 			// Normalize event times to session start so they align with point times.
@@ -208,6 +242,7 @@ func main() {
 		}
 		// Lap times with embedded sector splits (3 sectors by default).
 		cOut.LapTimes = track.ComputeLapMetrics(sess.samples, sess.track, sess.lapIdx, 3)
+		bestSectors := bestSectorTimes(cOut.LapTimes)
 		for lapNum := 1; lapNum < len(sess.lapIdx); lapNum++ {
 			start := sess.lapIdx[lapNum-1]
 			end := sess.lapIdx[lapNum]
@@ -215,10 +250,21 @@ func main() {
 				continue
 			}
 			segment := sess.track[start:end]
+			if len(segment) > 0 {
+				lapLength[lapNum] = segment[len(segment)-1].S - segment[0].S
+				if lapLength[lapNum] <= 0 {
+					lapLength[lapNum] = segment[len(segment)-1].S
+				}
+				lapStartTime[lapNum] = sess.samples[start].Time - sess.samples[0].Time
+				if lapStartTime[lapNum] < 0 {
+					lapStartTime[lapNum] = 0
+				}
+			}
 			track.MapToMaster(segment, masterTrack, start, func(idx int, relS, x, y float64, mi int, mRelS, mx, my, dist float64) {
 				var heading, speedMPH, speedKMH float64
 				var gear int
 				var t float64
+				var accel float64
 				if idx >= 0 && idx < len(sess.track) {
 					heading = sess.track[idx].Theta
 				}
@@ -227,16 +273,88 @@ func main() {
 					speedKMH = sess.samples[idx].SpeedKMH
 					gear = sess.samples[idx].Gear
 					t = sess.samples[idx].Time - sess.samples[0].Time
+					if idx > 0 {
+						prev := sess.samples[idx-1]
+						prevSpeed := prev.SpeedMPH
+						if prevSpeed == 0 {
+							prevSpeed = prev.Speed * 2.23694
+						}
+						curSpeed := speedMPH
+						if curSpeed == 0 {
+							curSpeed = sess.samples[idx].Speed * 2.23694
+						}
+						dt := sess.samples[idx].Time - prev.Time
+						if dt > 0 {
+							accel = (curSpeed - prevSpeed) / dt
+						}
+					}
+				}
+				if speedMPH == 0 && speedKMH > 0 {
+					speedMPH = speedKMH * 0.621371
+				}
+				if speedMPH == 0 && idx >= 0 && idx < len(sess.samples) {
+					speedMPH = sess.samples[idx].Speed * 2.23694
+					speedKMH = speedMPH * 1.60934
+				}
+				if speedKMH == 0 && speedMPH > 0 {
+					speedKMH = speedMPH * 1.60934
+				}
+				if mi >= 0 && mi < len(sumSpeed) {
+					sumSpeed[mi] += speedMPH
+					countSpeed[mi]++
+					if accel != 0 {
+						sumAccel[mi] += accel
+						countAccel[mi]++
+					}
+					if idx >= 0 && idx < len(surfaceLabels) {
+						surfaceCounts[mi][surfaceLabels[idx]]++
+					}
+				}
+				delta := 0.0
+				if lapStart, ok := lapStartTime[lapNum]; ok {
+					elapsedLap := t - lapStart
+					expected := expectedTimeForProgress(bestSectors, lapLength[lapNum], relS)
+					delta = elapsedLap - expected
+					if _, seen := lapDeltaOffset[lapNum]; !seen {
+						lapDeltaOffset[lapNum] = delta
+					}
+					delta -= lapDeltaOffset[lapNum]
+				}
+				currentSurface := ""
+				if idx >= 0 && idx < len(surfaceLabels) {
+					currentSurface = surfaceLabels[idx]
 				}
 				cOut.Points = append(cOut.Points, carPoint{
 					Time:     t,
 					Lap:      lapNum,
+					RelS:     relS,
 					Heading:  heading,
 					MasterX:  mx,
 					MasterY:  my,
 					SpeedMPH: speedMPH,
 					SpeedKMH: speedKMH,
 					Gear:     gear,
+					Delta:    delta,
+				})
+				if currentSurface != "" && currentSurface != lastSurface {
+					out.Events = append(out.Events, eventOut{
+						Type:    "surface",
+						Source:  sourceName,
+						Time:    t,
+						Note:    fmt.Sprintf("surface change %s", currentSurface),
+						Lap:     lapNum,
+						RelS:    relS,
+						MasterX: mx,
+						MasterY: my,
+					})
+					lastSurface = currentSurface
+				}
+				mapped[sourceName] = append(mapped[sourceName], track.MappedPoint{
+					Time:    t,
+					Lap:     lapNum,
+					RelS:    relS,
+					MasterX: mx,
+					MasterY: my,
 				})
 			})
 		}
@@ -268,10 +386,60 @@ func main() {
 		out.Cars = append(out.Cars, cOut)
 	}
 
+	// Detect overtakes across cars using mapped points.
+	if len(mapped) > 1 {
+		for _, ov := range track.DetectOvertakes(mapped) {
+			out.Events = append(out.Events, eventOut{
+				Type:    "overtake",
+				Source:  ov.Source,
+				Target:  ov.Target,
+				Time:    ov.Time,
+				Note:    fmt.Sprintf("%s passed %s", ov.Source, ov.Target),
+				Lap:     ov.Lap,
+				RelS:    ov.RelS,
+				MasterX: ov.MasterX,
+				MasterY: ov.MasterY,
+			})
+		}
+	}
+
 	// Sort events by time to make the viewer list ordered.
 	sort.Slice(out.Events, func(i, j int) bool {
 		return out.Events[i].Time < out.Events[j].Time
 	})
+
+	// Build heatmap averages
+	for i, p := range masterTrack {
+		if countSpeed[i] == 0 {
+			continue
+		}
+		surface := ""
+		if len(surfaceCounts[i]) > 0 {
+			maxCnt := 0
+			for k, v := range surfaceCounts[i] {
+				if v > maxCnt {
+					maxCnt = v
+					surface = k
+				}
+			}
+		}
+		out.Heatmap = append(out.Heatmap, heatOut{
+			Index: i,
+			RelS:  p.S,
+			X:     p.X,
+			Y:     p.Y,
+			AvgAccel: func() float64 {
+				if countAccel[i] == 0 {
+					return 0
+				}
+				return sumAccel[i] / float64(countAccel[i])
+			}(),
+			Surface: surface,
+		})
+		if i < len(out.Master) {
+			out.Master[i].Surface = surface
+		}
+	}
 
 	var buf strings.Builder
 	enc := json.NewEncoder(&buf)
@@ -358,6 +526,84 @@ func serveViewer(addr, webDir, dataPath string) {
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
+// bestSectorTimes returns the best sector times per index from lap metrics.
+func bestSectorTimes(laps []track.LapMetrics) []float64 {
+	var best []float64
+	for _, lm := range laps {
+		for i, t := range lm.SectorTime {
+			if t <= 0 {
+				continue
+			}
+			if i >= len(best) {
+				best = append(best, t)
+			} else if best[i] == 0 || t < best[i] {
+				best[i] = t
+			}
+		}
+	}
+	return best
+}
+
+func expectedTimeForProgress(best []float64, lapLen, relS float64) float64 {
+	if lapLen <= 0 || len(best) == 0 {
+		return 0
+	}
+	sectorLen := lapLen / float64(len(best))
+	idx := int(relS / sectorLen)
+	if idx >= len(best) {
+		idx = len(best) - 1
+	}
+	inSector := relS - float64(idx)*sectorLen
+	expected := 0.0
+	for i := 0; i < idx; i++ {
+		expected += best[i]
+	}
+	if sectorLen > 0 {
+		expected += best[idx] * (inSector / sectorLen)
+	}
+	return expected
+}
+
+// pointAtTime returns interpolated carPoint at time t.
+func pointAtTime(points []carPoint, t float64) (carPoint, bool) {
+	if len(points) == 0 {
+		return carPoint{}, false
+	}
+	if t <= points[0].Time {
+		return points[0], true
+	}
+	if t >= points[len(points)-1].Time {
+		return points[len(points)-1], true
+	}
+	lo, hi := 0, len(points)-1
+	for hi-lo > 1 {
+		mid := (hi + lo) >> 1
+		if points[mid].Time <= t {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	p1, p2 := points[lo], points[hi]
+	span := p2.Time - p1.Time
+	if span <= 0 {
+		return p1, true
+	}
+	alpha := (t - p1.Time) / span
+	return carPoint{
+		Time:     t,
+		Lap:      p1.Lap,
+		RelS:     p1.RelS + (p2.RelS-p1.RelS)*alpha,
+		Heading:  p1.Heading + (p2.Heading-p1.Heading)*alpha,
+		MasterX:  p1.MasterX + (p2.MasterX-p1.MasterX)*alpha,
+		MasterY:  p1.MasterY + (p2.MasterY-p1.MasterY)*alpha,
+		SpeedMPH: p1.SpeedMPH + (p2.SpeedMPH-p1.SpeedMPH)*alpha,
+		SpeedKMH: p1.SpeedKMH + (p2.SpeedKMH-p1.SpeedKMH)*alpha,
+		Gear:     p1.Gear,
+		Delta:    p1.Delta + (p2.Delta-p1.Delta)*alpha,
+	}, true
+}
+
 func LoadSamplesFromCSV(path string) ([]models.Sample, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -421,6 +667,12 @@ func LoadSamplesFromCSV(path string) ([]models.Sample, error) {
 		}
 		if idx, ok := cols["speed_kmh"]; ok {
 			speedKMH = parseOrZero(row[idx])
+		}
+		if speedKMH == 0 {
+			speedKMH = speed * 3.6
+		}
+		if speedMPH == 0 {
+			speedMPH = speed * 2.23694
 		}
 
 		gear := 0
