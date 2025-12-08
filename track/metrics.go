@@ -102,3 +102,30 @@ func ComputeLapMetrics(samples []models.Sample, points []models.Trackpoint, lapI
 
 	return out
 }
+
+// ComputeSteeringAngles estimates steering angle (deg) per point using signed curvature and a given wheelbase.
+// Uses three-point windows; endpoints are left at zero if insufficient neighbors.
+func ComputeSteeringAngles(points []models.Trackpoint, wheelbase float64) []float64 {
+	out := make([]float64, len(points))
+	if len(points) < 3 || wheelbase <= 0 {
+		return out
+	}
+	for i := 1; i < len(points)-1; i++ {
+		p0 := points[i-1]
+		p1 := points[i]
+		p2 := points[i+1]
+		v1x := p1.X - p0.X
+		v1y := p1.Y - p0.Y
+		v2x := p2.X - p1.X
+		v2y := p2.Y - p1.Y
+		d1 := math.Hypot(v1x, v1y)
+		d2 := math.Hypot(v2x, v2y)
+		if d1 < 1e-3 || d2 < 1e-3 {
+			continue
+		}
+		cross := v1x*v2y - v1y*v2x
+		curvature := cross / (d1 * d2)
+		out[i] = math.Atan(curvature*wheelbase) * 180 / math.Pi
+	}
+	return out
+}

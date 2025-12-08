@@ -73,6 +73,22 @@ func BuildMasterLap(points []models.Trackpoint, lapIdx []int, samples int) []mod
 	return master
 }
 
+// BuildMasterPath builds a master path for an open/sprint-style run.
+// It re-bases arc length to start at 0 without forcing the path to close,
+// then resamples to the requested number of samples.
+func BuildMasterPath(points []models.Trackpoint, samples int, closeLoop bool) []models.Trackpoint {
+	if len(points) < 2 || samples < 2 {
+		return nil
+	}
+	var prep []models.Trackpoint
+	if closeLoop {
+		prep = NormalizeLapSegment(points)
+	} else {
+		prep = RecomputeArcLength(points)
+	}
+	return resampleLap(prep, 0, len(prep), samples)
+}
+
 // resampleLap: resample lap [start:end] to 'samples' pts, evenly spaced by S.
 func resampleLap(points []models.Trackpoint, start, end, samples int) []models.Trackpoint {
 	if end <= start+1 || samples < 2 {

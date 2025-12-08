@@ -12,11 +12,17 @@
   const deltaCtx = deltaCanvas.getContext("2d");
   const deltaInfo = document.getElementById("deltaInfo");
   const deltaPlayer = document.getElementById("deltaPlayer");
+  const steerCanvas = document.getElementById("steer");
+  const steerCtx = steerCanvas.getContext("2d");
+  const steerInfo = document.getElementById("steerInfo");
   const liveEl = document.getElementById("live");
   const livePanel = document.getElementById("livePanel");
   const settingsBtn = document.getElementById("settingsBtn");
   const settingsOverlay = document.getElementById("settingsOverlay");
   const settingsClose = document.getElementById("settingsClose");
+  const showControlsAll = document.getElementById("showControlsAll");
+  const showEventsToggle = document.getElementById("showEvents");
+  const eventFilterEl = document.getElementById("eventFilter");
   const staticCanvas = document.createElement("canvas");
   const staticCtx = staticCanvas.getContext("2d");
 
@@ -31,6 +37,10 @@
   const hudInterval = 100; // ms
   let carCursors = [];
   let frameCapMs = 1000 / 45;
+  let selectedCar = null; // null = show all
+  let showControls = false;
+  let showEvents = false;
+  let eventTypes = new Set(["crash", "collision", "reset", "surface", "overtake"]);
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -42,6 +52,12 @@
     deltaCanvas.width = drect.width * dpr;
     deltaCanvas.height = drect.height * dpr;
     deltaCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (steerCanvas && steerCtx) {
+      const srect = steerCanvas.getBoundingClientRect();
+      steerCanvas.width = srect.width * dpr;
+      steerCanvas.height = srect.height * dpr;
+      steerCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
     staticCanvas.width = rect.width;
     staticCanvas.height = rect.height;
     staticCtx.setTransform(1, 0, 0, 1, 0, 0);
@@ -139,16 +155,38 @@
       });
       if (r.checked) unit = r.value;
     });
+    if (showControlsAll) {
+      showControlsAll.checked = showControls;
+      showControlsAll.addEventListener("change", (e) => {
+        showControls = e.target.checked;
+        updateLive();
+      });
+    }
+    if (showEventsToggle) {
+      showEventsToggle.checked = showEvents;
+      showEventsToggle.addEventListener("change", (e) => {
+        showEvents = e.target.checked;
+        buildEventFilter();
+        renderStatic();
+        draw();
+      });
+    }
+  }
+
+  function orient(pt) {
+    // Mirror X to correct left/right flip; Y orientation handled in projection invert.
+    return { x: -pt.x, y: pt.y };
   }
 
   function getBounds() {
     const pts = data.master || [];
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     pts.forEach((p) => {
-      minX = Math.min(minX, p.x);
-      minY = Math.min(minY, p.y);
-      maxX = Math.max(maxX, p.x);
-      maxY = Math.max(maxY, p.y);
+      const o = orient(p);
+      minX = Math.min(minX, o.x);
+      minY = Math.min(minY, o.y);
+      maxX = Math.max(maxX, o.x);
+      maxY = Math.max(maxY, o.y);
     });
     // pad a bit
     const pad = 100;
@@ -156,6 +194,7 @@
   }
 
   function project(pt, bounds, w, h) {
+    const o = orient(pt);
     const sx = w / (bounds.maxX - bounds.minX || 1);
     const sy = h / (bounds.maxY - bounds.minY || 1);
     const scale = Math.min(sx, sy) * 0.95;
@@ -164,8 +203,8 @@
     const ox = w / 2;
     const oy = h / 2;
     return {
-      x: ox + (pt.x - cx) * scale,
-      y: oy - (pt.y - cy) * scale, // invert Y for screen
+      x: ox + (o.x - cx) * scale,
+      y: oy - (o.y - cy) * scale, // invert Y for screen
     };
   }
 
@@ -173,6 +212,12 @@
     "#ffb100", "#6bc5ff", "#ff6b6b", "#7bd389", "#f78bff", "#ffd166",
     "#7af8ff", "#c084fc", "#90e0ef", "#ff9f1c",
   ];
+
+  function filteredCars() {
+    if (selectedCar === null) return data.cars || [];
+    const car = (data.cars || [])[selectedCar];
+    return car ? [car] : [];
+  }
 
   function draw() {
     const w = canvas.clientWidth;
@@ -184,9 +229,10 @@
     const bounds = boundsCache || getBounds();
 
     // Cars (head only)
-    (data.cars || []).forEach((car, idx) => {
-      const color = palette[idx % palette.length];
-      const head = headAtTime(idx, currentTime);
+    filteredCars().forEach((car, idx) => {
+      const globalIdx = selectedCar !== null ? selectedCar : idx;
+      const color = palette[globalIdx % palette.length];
+      const head = headAtTime(globalIdx, currentTime);
       if (head) {
         const { x, y } = project({ x: head.masterX, y: head.masterY }, bounds, w, h);
         ctx.fillStyle = color;
@@ -235,6 +281,21 @@
       else staticCtx.lineTo(x, y);
     });
     staticCtx.stroke();
+
+    // Events on map (optional)
+    if (showEvents && data.events && data.events.length) {
+      data.events.forEach((ev) => {
+        const t = (ev.type || "").toLowerCase();
+        if (!eventTypes.has(t)) return;
+        const pt = { x: ev.masterX ?? ev.x, y: ev.masterY ?? ev.y };
+        if (!isFinite(pt.x) || !isFinite(pt.y)) return;
+        const { x, y } = project(pt, bounds, w, h);
+        staticCtx.fillStyle = eventColor(ev.type || "");
+        staticCtx.beginPath();
+        staticCtx.arc(x, y, 4, 0, Math.PI * 2);
+        staticCtx.fill();
+      });
+    }
   }
 
   function heatScale(vals) {
@@ -289,6 +350,13 @@
       speedKMH: p1.speedKMH + (p2.speedKMH - p1.speedKMH) * alpha,
       gear: p1.gear,
       delta: p1.delta + (p2.delta - p1.delta) * alpha,
+      longAcc: p1.longAcc + (p2.longAcc - p1.longAcc) * alpha,
+      latAcc: p1.latAcc + (p2.latAcc - p1.latAcc) * alpha,
+      yawRate: p1.yawRate + (p2.yawRate - p1.yawRate) * alpha,
+      yawDegS: p1.yawDegS + (p2.yawDegS - p1.yawDegS) * alpha,
+      throttle: p1.throttle + (p2.throttle - p1.throttle) * alpha,
+      brake: p1.brake + (p2.brake - p1.brake) * alpha,
+      steerDeg: p1.steerDeg + (p2.steerDeg - p1.steerDeg) * alpha,
     };
   }
 
@@ -297,16 +365,46 @@
     (data.cars || []).forEach((car, idx) => {
       const color = palette[idx % palette.length];
       const el = document.createElement("span");
-      el.className = "swatch";
+      el.className = "swatch" + (selectedCar === idx ? " selected" : "");
       el.innerHTML = `<span class="dot" style="background:${color}"></span>${car.source || "car " + (idx + 1)}`;
+      el.style.cursor = "pointer";
+      el.addEventListener("click", () => {
+        selectedCar = selectedCar === idx ? null : idx;
+        deltaPlayer.value = selectedCar === null ? 0 : idx;
+        buildLegend();
+        buildEvents();
+        updateLive();
+        updateDelta(true);
+        draw();
+      });
       legendEl.appendChild(el);
     });
-    if ((data.events || []).length > 0) {
-      const evs = document.createElement("span");
-      evs.className = "swatch";
-      evs.innerHTML = `<span class="dot" style="background:${eventColor("reset")}"></span>events`;
-      legendEl.appendChild(evs);
-    }
+    buildEventFilter();
+  }
+
+  function buildEventFilter() {
+    if (!eventFilterEl) return;
+    eventFilterEl.innerHTML = "";
+    const types = ["crash", "collision", "reset", "surface", "overtake"];
+    types.forEach((t) => {
+      const id = `ev-${t}`;
+      const label = document.createElement("label");
+      label.htmlFor = id;
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.id = id;
+      cb.checked = eventTypes.has(t);
+      cb.addEventListener("change", (e) => {
+        if (e.target.checked) eventTypes.add(t); else eventTypes.delete(t);
+        buildEvents();
+        renderStatic();
+        draw();
+      });
+      label.appendChild(cb);
+      label.appendChild(document.createTextNode(` ${t}`));
+      eventFilterEl.appendChild(label);
+    });
+    eventFilterEl.style.display = showEvents ? "flex" : "none";
   }
 
   function ms(x) { return (x * 1000).toFixed(0); }
@@ -369,8 +467,17 @@
       opt.textContent = car.source || `Car ${idx + 1}`;
       deltaPlayer.appendChild(opt);
     });
+    if (selectedCar !== null) {
+      deltaPlayer.value = selectedCar;
+    }
     deltaPlayer.addEventListener("change", () => {
+      selectedCar = parseInt(deltaPlayer.value, 10);
+      buildLegend();
+      buildEvents();
+      updateLive();
       updateDelta();
+      updateSteering();
+      draw();
     });
   }
 
@@ -390,13 +497,23 @@
       case "crash": return "#ff6b6b";
       case "collision": return "#f3a712";
       case "reset": return "#5dd39e";
+      case "surface": return "#6bc5ff";
+      case "overtake": return "#f78bff";
       default: return "#cdd7e1";
     }
   }
 
   function buildEvents() {
     eventsEl.innerHTML = "";
-    (data.events || []).forEach((ev) => {
+    const list = (data.events || []).filter((ev) => {
+      if (selectedCar !== null) {
+        const car = (data.cars || [])[selectedCar];
+        if (car && ev.source !== car.source && ev.target !== car.source) return false;
+      }
+      if (!eventTypes.has((ev.type || "").toLowerCase())) return false;
+      return true;
+    });
+    list.forEach((ev) => {
       const row = document.createElement("div");
       row.className = "event-row";
       const color = eventColor(ev.type);
@@ -475,6 +592,7 @@
     if (!force && now - lastHudUpdate < hudInterval) return;
     lastHudUpdate = now;
     updateDelta();
+    updateSteering();
     updateLive();
   }
 
@@ -519,6 +637,13 @@
       speedKMH: p1.speedKMH + (p2.speedKMH - p1.speedKMH) * alpha,
       gear: p1.gear,
       delta: p1.delta + (p2.delta - p1.delta) * alpha,
+      longAcc: p1.longAcc + (p2.longAcc - p1.longAcc) * alpha,
+      latAcc: p1.latAcc + (p2.latAcc - p1.latAcc) * alpha,
+      yawRate: p1.yawRate + (p2.yawRate - p1.yawRate) * alpha,
+      yawDegS: p1.yawDegS + (p2.yawDegS - p1.yawDegS) * alpha,
+      throttle: p1.throttle + (p2.throttle - p1.throttle) * alpha,
+      brake: p1.brake + (p2.brake - p1.brake) * alpha,
+      steerDeg: p1.steerDeg + (p2.steerDeg - p1.steerDeg) * alpha,
     };
   }
 
@@ -624,17 +749,76 @@
     deltaInfo.textContent = `${car.source} lap ${lap} delta vs best sectors`;
   }
 
+  function updateSteering() {
+    if (!steerCanvas || !steerCtx) return;
+    const idx = selectedCar !== null ? selectedCar : parseInt(deltaPlayer.value || "0", 10) || 0;
+    const car = (data.cars || [])[idx];
+    if (!car || !car.points || car.points.length === 0) {
+      steerCtx.clearRect(0, 0, steerCanvas.clientWidth, steerCanvas.clientHeight);
+      if (steerInfo) steerInfo.textContent = "";
+      return;
+    }
+    const head = positionAtTime(car.points, currentTime);
+    if (!head) return;
+    const lap = head.lap;
+    const points = car.points.filter((p) => p.lap === lap && isFinite(p.steerDeg));
+    points.sort((a, b) => a.relS - b.relS);
+    if (points.length === 0) {
+      steerCtx.clearRect(0, 0, steerCanvas.clientWidth, steerCanvas.clientHeight);
+      if (steerInfo) steerInfo.textContent = "";
+      return;
+    }
+    const w = steerCanvas.clientWidth;
+    const h = steerCanvas.clientHeight;
+    steerCtx.clearRect(0, 0, w, h);
+    const xs = points.map((p) => p.relS);
+    const ys = points.map((p) => p.steerDeg); // deg
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    let maxAbs = Math.max(Math.abs(Math.min(...ys)), Math.abs(Math.max(...ys)));
+    if (maxAbs === 0) maxAbs = 0.1;
+    const mid = h / 2;
+    const toX = (v) => ((v - minX) / (maxX - minX || 1)) * w;
+    const toY = (v) => mid + (v / maxAbs) * (h / 2);
+
+    steerCtx.strokeStyle = "rgba(255,255,255,0.3)";
+    steerCtx.lineWidth = 1;
+    steerCtx.beginPath();
+    steerCtx.moveTo(0, mid);
+    steerCtx.lineTo(w, mid);
+    steerCtx.stroke();
+
+    steerCtx.strokeStyle = palette[idx % palette.length];
+    steerCtx.lineWidth = 1.5;
+    steerCtx.beginPath();
+    points.forEach((p, i) => {
+      const x = toX(p.relS);
+      const y = toY(ys[i]);
+      if (i === 0) steerCtx.moveTo(x, y); else steerCtx.lineTo(x, y);
+    });
+    steerCtx.stroke();
+
+    if (steerInfo) {
+      steerInfo.textContent = `${car.source} lap ${lap} steering (deg), ±${maxAbs.toFixed(1)} scale`;
+    }
+  }
+
   function updateLive() {
     if (!liveEl) return;
     liveEl.innerHTML = "";
-    (data.cars || []).forEach((car, idx) => {
+    filteredCars().forEach((car, idx) => {
+      const globalIdx = selectedCar !== null ? selectedCar : idx;
       const head = positionAtTime(car.points || [], currentTime);
       const speed = unit === "kmh" ? head?.speedKMH ?? null : head?.speedMPH ?? null;
       const gear = head?.gear ?? null;
+      const throttle = head?.throttle ?? 0;
+      const brake = head?.brake ?? 0;
+      const latG = head && isFinite(head.latAcc) ? head.latAcc / 9.81 : null;
+      const longG = head && isFinite(head.longAcc) ? head.longAcc / 9.81 : null;
+      const yaw = head && isFinite(head.yawRate) ? head.yawRate * (180 / Math.PI) : null;
       const row = document.createElement("div");
       row.className = "live-row";
       const name = document.createElement("span");
-      name.textContent = car.source || `Car ${idx + 1}`;
+      name.textContent = car.source || `Car ${globalIdx + 1}`;
       const vals = document.createElement("span");
       vals.textContent = `${speed ? speed.toFixed(1) : "--"} ${unit === "kmh" ? "km/h" : "mph"} | Gear ${gear ?? "-"}`;
       row.appendChild(name);
@@ -653,7 +837,47 @@
       label.className = "speed-label";
       label.textContent = `0 - ${maxSpeedEstimate()} ${unit === "kmh" ? "km/h" : "mph"} scale`;
       liveEl.appendChild(label);
+
+      // Controls / dynamics meters
+      const shouldShowControls = showControls || selectedCar !== null;
+      if (shouldShowControls) {
+        liveEl.appendChild(makeMeter("Throttle", throttle, "#5dd39e"));
+        liveEl.appendChild(makeMeter("Brake", brake, "#ff6b6b"));
+      }
+
+      const dynamics = document.createElement("div");
+      dynamics.className = "live-row";
+      const dynLabel = document.createElement("span");
+      dynLabel.textContent = "Lat/Long/Yaw";
+      const dynVals = document.createElement("span");
+      dynVals.textContent = `${latG !== null ? latG.toFixed(2) : "--"}g / ${longG !== null ? longG.toFixed(2) : "--"}g / ${yaw !== null ? yaw.toFixed(1) : "--"}°/s`;
+      dynamics.appendChild(dynLabel);
+      dynamics.appendChild(dynVals);
+      liveEl.appendChild(dynamics);
     });
+  }
+
+  function makeMeter(label, value, color) {
+    const wrap = document.createElement("div");
+    wrap.className = "meter";
+    const row = document.createElement("div");
+    row.className = "live-row meter-row";
+    const l = document.createElement("span");
+    l.textContent = label;
+    const v = document.createElement("span");
+    v.textContent = `${(value * 100).toFixed(0)}%`;
+    row.appendChild(l);
+    row.appendChild(v);
+    const bar = document.createElement("div");
+    bar.className = "meter-bar";
+    const fill = document.createElement("div");
+    fill.className = "meter-fill";
+    fill.style.background = color;
+    fill.style.width = `${Math.max(0, Math.min(1, value)) * 100}%`;
+    bar.appendChild(fill);
+    wrap.appendChild(row);
+    wrap.appendChild(bar);
+    return wrap;
   }
 
   function maxSpeedEstimate() {
