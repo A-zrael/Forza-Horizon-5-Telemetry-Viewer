@@ -50,6 +50,7 @@ type eventOut struct {
 	MasterX    float64 `json:"masterX,omitempty"`
 	MasterY    float64 `json:"masterY,omitempty"`
 	DistanceSq float64 `json:"distanceSq,omitempty"`
+	RacePos    int     `json:"racePosition,omitempty"`
 }
 
 type carPoint struct {
@@ -82,13 +83,86 @@ type carPoint struct {
 	TireTempFR    float64 `json:"tireTempFR,omitempty"`
 	TireTempRL    float64 `json:"tireTempRL,omitempty"`
 	TireTempRR    float64 `json:"tireTempRR,omitempty"`
+	DistToLine    float64 `json:"distToLine,omitempty"`
 }
 
 type carOut struct {
-	Source   string             `json:"source"`
-	Points   []carPoint         `json:"points,omitempty"`
-	LapTimes []track.LapMetrics `json:"lapTimes,omitempty"`
-	RaceType string             `json:"raceType,omitempty"`
+	Source      string              `json:"source"`
+	Points      []carPoint          `json:"points,omitempty"`
+	LapTimes    []track.LapMetrics  `json:"lapTimes,omitempty"`
+	RaceType    string              `json:"raceType,omitempty"`
+	Corners     []cornerStatOut     `json:"corners,omitempty"`
+	CornersLap  []cornerLapStatOut  `json:"cornersLap,omitempty"`
+	Segments    []segmentStatOut    `json:"segments,omitempty"`
+	SegmentsLap []segmentLapStatOut `json:"segmentsLap,omitempty"`
+}
+
+type cornerOut struct {
+	Index     int     `json:"index"`
+	StartS    float64 `json:"startS"`
+	EndS      float64 `json:"endS"`
+	ApexS     float64 `json:"apexS"`
+	Direction string  `json:"direction,omitempty"`
+	AngleDeg  float64 `json:"angleDeg,omitempty"`
+}
+
+type cornerStatOut struct {
+	Corner   int     `json:"corner"`
+	Count    int     `json:"count"`
+	EntryMPH float64 `json:"entryMPH,omitempty"`
+	MinMPH   float64 `json:"minMPH,omitempty"`
+	ExitMPH  float64 `json:"exitMPH,omitempty"`
+	EntryKMH float64 `json:"entryKMH,omitempty"`
+	MinKMH   float64 `json:"minKMH,omitempty"`
+	ExitKMH  float64 `json:"exitKMH,omitempty"`
+}
+
+type segmentDefOut struct {
+	Index  int     `json:"index"`
+	Type   string  `json:"type"` // corner or straight
+	StartS float64 `json:"startS"`
+	EndS   float64 `json:"endS"`
+}
+
+type segmentStatOut struct {
+	Segment  int     `json:"segment"`
+	Type     string  `json:"type"`
+	Count    int     `json:"count"`
+	EntryMPH float64 `json:"entryMPH,omitempty"`
+	MinMPH   float64 `json:"minMPH,omitempty"`
+	ExitMPH  float64 `json:"exitMPH,omitempty"`
+	AvgMPH   float64 `json:"avgMPH,omitempty"`
+	Time     float64 `json:"time,omitempty"`
+	EntryKMH float64 `json:"entryKMH,omitempty"`
+	MinKMH   float64 `json:"minKMH,omitempty"`
+	ExitKMH  float64 `json:"exitKMH,omitempty"`
+	AvgKMH   float64 `json:"avgKMH,omitempty"`
+}
+
+type segmentLapStatOut struct {
+	Segment  int     `json:"segment"`
+	Lap      int     `json:"lap"`
+	Type     string  `json:"type"`
+	EntryMPH float64 `json:"entryMPH,omitempty"`
+	MinMPH   float64 `json:"minMPH,omitempty"`
+	ExitMPH  float64 `json:"exitMPH,omitempty"`
+	AvgMPH   float64 `json:"avgMPH,omitempty"`
+	Time     float64 `json:"time,omitempty"`
+	EntryKMH float64 `json:"entryKMH,omitempty"`
+	MinKMH   float64 `json:"minKMH,omitempty"`
+	ExitKMH  float64 `json:"exitKMH,omitempty"`
+	AvgKMH   float64 `json:"avgKMH,omitempty"`
+}
+
+type cornerLapStatOut struct {
+	Corner   int     `json:"corner"`
+	Lap      int     `json:"lap"`
+	EntryMPH float64 `json:"entryMPH,omitempty"`
+	MinMPH   float64 `json:"minMPH,omitempty"`
+	ExitMPH  float64 `json:"exitMPH,omitempty"`
+	EntryKMH float64 `json:"entryKMH,omitempty"`
+	MinKMH   float64 `json:"minKMH,omitempty"`
+	ExitKMH  float64 `json:"exitKMH,omitempty"`
 }
 
 func main() {
@@ -275,12 +349,45 @@ func main() {
 		os.Exit(1)
 	}
 
+	cornerDefs := track.DetectCorners(masterTrack)
+	cornerOuts := make([]cornerOut, 0, len(cornerDefs))
+	for _, c := range cornerDefs {
+		cornerOuts = append(cornerOuts, cornerOut{
+			Index:     c.Index,
+			StartS:    c.StartS,
+			EndS:      c.EndS,
+			ApexS:     c.ApexS,
+			Direction: c.Direction,
+			AngleDeg:  c.AngleRad * 180 / math.Pi,
+		})
+	}
+	segmentDefs := buildSegments(masterTrack, cornerDefs)
+	segmentOuts := make([]segmentDefOut, 0, len(segmentDefs))
+	for i, s := range segmentDefs {
+		segmentOuts = append(segmentOuts, segmentDefOut{
+			Index:  i,
+			Type:   s.segType,
+			StartS: s.startS,
+			EndS:   s.endS,
+		})
+	}
+
+	// Add braking timing events (early/late) per session using master track reference.
+	for i := range sessions {
+		brakeEvents := track.DetectBrakeTiming(sessions[i].samples, sessions[i].track, sessions[i].lapIdx, masterTrack)
+		if len(brakeEvents) > 0 {
+			sessions[i].events = append(sessions[i].events, brakeEvents...)
+		}
+	}
+
 	out := struct {
-		Master   []masterOut `json:"master"`
-		Heatmap  []heatOut   `json:"heatmap,omitempty"`
-		Events   []eventOut  `json:"events,omitempty"`
-		Cars     []carOut    `json:"cars,omitempty"`
-		RaceType string      `json:"raceType,omitempty"`
+		Master   []masterOut     `json:"master"`
+		Corners  []cornerOut     `json:"corners,omitempty"`
+		Segments []segmentDefOut `json:"segments,omitempty"`
+		Heatmap  []heatOut       `json:"heatmap,omitempty"`
+		Events   []eventOut      `json:"events,omitempty"`
+		Cars     []carOut        `json:"cars,omitempty"`
+		RaceType string          `json:"raceType,omitempty"`
 	}{}
 
 	for _, p := range masterTrack {
@@ -290,6 +397,8 @@ func main() {
 			Y:    p.Y,
 		})
 	}
+	out.Segments = segmentOuts
+	out.Corners = cornerOuts
 
 	// Parallel per-session processing for mapping/metrics/events.
 	type partial struct {
@@ -337,6 +446,9 @@ func main() {
 			lapDeltaOffset := make(map[int]float64)
 			surfaceLabels := track.ClassifySurface(sess.samples, sess.track, 30)
 			lastSurface := ""
+			if len(surfaceLabels) > 0 {
+				lastSurface = surfaceLabels[0]
+			}
 			if len(sess.samples) > 0 {
 				for i := range sess.events {
 					sess.events[i].Time -= sess.samples[0].Time
@@ -488,6 +600,7 @@ func main() {
 					var steer float64
 					var suspFL, suspFR, suspRL, suspRR float64
 					var tempFL, tempFR, tempRL, tempRR float64
+					distToLine := 0.0
 					if idx >= 0 && idx < len(sess.track) {
 						heading = sess.track[idx].Theta
 						yr = yawRate[idx]
@@ -535,6 +648,12 @@ func main() {
 						if accel == 0 {
 							accel = lngAcc
 						}
+					}
+					if idx >= 0 && idx < len(sess.samples) {
+						// Forza provides norm_driving_line in approx -127..127; scale to -100..100.
+						distToLine = float64(sess.samples[idx].NormDrivingLine) / 127.0 * 100.0
+					} else {
+						distToLine = track.SignedDistanceAtRelS(masterTrack, mRelS, x, y)
 					}
 					if speedMPH == 0 && speedKMH > 0 {
 						speedMPH = speedKMH * 0.621371
@@ -648,8 +767,9 @@ func main() {
 						TireTempFR:    tempFR,
 						TireTempRL:    tempRL,
 						TireTempRR:    tempRR,
+						DistToLine:    distToLine,
 					})
-					if currentSurface != "" && currentSurface != lastSurface {
+					if idx > 0 && currentSurface != "" && currentSurface != lastSurface {
 						res.events = append(res.events, eventOut{
 							Type:    "surface",
 							Source:  sourceName,
@@ -659,6 +779,7 @@ func main() {
 							RelS:    relS,
 							MasterX: mx,
 							MasterY: my,
+							RacePos: sess.samples[idx].RacePosition,
 						})
 						lastSurface = currentSurface
 					}
@@ -679,6 +800,10 @@ func main() {
 				lapNum, relS := track.FindLapAndRelS(sess.lapIdx, sess.track, ev.Index)
 				px, py := sess.track[ev.Index].X, sess.track[ev.Index].Y
 				mi, mRelS, mx, my, dist := track.MapRelSToMaster(masterTrack, relS, px, py)
+				rp := 0
+				if ev.Index >= 0 && ev.Index < len(sess.samples) {
+					rp = sess.samples[ev.Index].RacePosition
+				}
 				eo := eventOut{
 					Type:       ev.Type,
 					Source:     sourceName,
@@ -692,6 +817,7 @@ func main() {
 					MasterX:    mx,
 					MasterY:    my,
 					DistanceSq: dist,
+					RacePos:    rp,
 				}
 				res.events = append(res.events, eo)
 			}
@@ -754,6 +880,16 @@ func main() {
 	sort.Slice(out.Events, func(i, j int) bool {
 		return out.Events[i].Time < out.Events[j].Time
 	})
+
+	// Corner stats per car
+	for ci := range out.Cars {
+		sum, perLap := analyzeCorners(out.Cars[ci].Points, masterTrack, cornerDefs)
+		out.Cars[ci].Corners = sum
+		out.Cars[ci].CornersLap = perLap
+		segSum, segLap := analyzeSegments(out.Cars[ci].Points, masterTrack, segmentDefs)
+		out.Cars[ci].Segments = segSum
+		out.Cars[ci].SegmentsLap = segLap
+	}
 
 	if lappedCount == 0 && sprintCount > 0 {
 		out.RaceType = "sprint"
@@ -945,16 +1081,17 @@ func pointAtTime(points []carPoint, t float64) (carPoint, bool) {
 	}
 	alpha := (t - p1.Time) / span
 	return carPoint{
-		Time:     t,
-		Lap:      p1.Lap,
-		RelS:     p1.RelS + (p2.RelS-p1.RelS)*alpha,
-		Heading:  p1.Heading + (p2.Heading-p1.Heading)*alpha,
-		MasterX:  p1.MasterX + (p2.MasterX-p1.MasterX)*alpha,
-		MasterY:  p1.MasterY + (p2.MasterY-p1.MasterY)*alpha,
-		SpeedMPH: p1.SpeedMPH + (p2.SpeedMPH-p1.SpeedMPH)*alpha,
-		SpeedKMH: p1.SpeedKMH + (p2.SpeedKMH-p1.SpeedKMH)*alpha,
-		Gear:     p1.Gear,
-		Delta:    p1.Delta + (p2.Delta-p1.Delta)*alpha,
+		Time:       t,
+		Lap:        p1.Lap,
+		RelS:       p1.RelS + (p2.RelS-p1.RelS)*alpha,
+		Heading:    p1.Heading + (p2.Heading-p1.Heading)*alpha,
+		MasterX:    p1.MasterX + (p2.MasterX-p1.MasterX)*alpha,
+		MasterY:    p1.MasterY + (p2.MasterY-p1.MasterY)*alpha,
+		SpeedMPH:   p1.SpeedMPH + (p2.SpeedMPH-p1.SpeedMPH)*alpha,
+		SpeedKMH:   p1.SpeedKMH + (p2.SpeedKMH-p1.SpeedKMH)*alpha,
+		Gear:       p1.Gear,
+		Delta:      p1.Delta + (p2.Delta-p1.Delta)*alpha,
+		DistToLine: p1.DistToLine + (p2.DistToLine-p1.DistToLine)*alpha,
 	}, true
 }
 
@@ -982,6 +1119,193 @@ func percentile(vals []float64, p float64) float64 {
 	}
 	alpha := idx - float64(lo)
 	return s[lo]*(1-alpha) + s[hi]*alpha
+}
+
+func analyzeCorners(points []carPoint, master []models.Trackpoint, defs []track.CornerDef) ([]cornerStatOut, []cornerLapStatOut) {
+	if len(points) == 0 || len(defs) == 0 {
+		return nil, nil
+	}
+	// Group points by lap for easier slicing.
+	byLap := make(map[int][]carPoint)
+	for _, p := range points {
+		byLap[p.Lap] = append(byLap[p.Lap], p)
+	}
+
+	out := make([]cornerStatOut, len(defs))
+	var perLap []cornerLapStatOut
+	for i, c := range defs {
+		stats := cornerStatOut{Corner: c.Index}
+		for _, lapPts := range byLap {
+			var entry, exit, min float64
+			min = math.MaxFloat64
+			found := false
+			for idx, p := range lapPts {
+				if p.RelS < c.StartS {
+					continue
+				}
+				if p.RelS > c.EndS {
+					// exiting corner; last valid was exit
+					break
+				}
+				if !found {
+					entry = p.SpeedMPH
+					found = true
+				}
+				if p.SpeedMPH < min {
+					min = p.SpeedMPH
+				}
+				exit = p.SpeedMPH
+				// if near end, try to include next point if also within small range
+				_ = idx
+			}
+			if found {
+				stats.Count++
+				stats.EntryMPH += entry
+				stats.MinMPH += min
+				stats.ExitMPH += exit
+				perLap = append(perLap, cornerLapStatOut{
+					Corner:   c.Index,
+					Lap:      lapPts[0].Lap,
+					EntryMPH: entry,
+					MinMPH:   min,
+					ExitMPH:  exit,
+					EntryKMH: entry * 1.60934,
+					MinKMH:   min * 1.60934,
+					ExitKMH:  exit * 1.60934,
+				})
+			}
+		}
+		if stats.Count > 0 {
+			n := float64(stats.Count)
+			stats.EntryMPH /= n
+			stats.MinMPH /= n
+			stats.ExitMPH /= n
+			stats.EntryKMH = stats.EntryMPH * 1.60934
+			stats.MinKMH = stats.MinMPH * 1.60934
+			stats.ExitKMH = stats.ExitMPH * 1.60934
+			out[i] = stats
+		}
+	}
+	// Filter out empty entries.
+	var compact []cornerStatOut
+	for _, s := range out {
+		if s.Count > 0 {
+			compact = append(compact, s)
+		}
+	}
+	return compact, perLap
+}
+
+type segmentDef struct {
+	segType string
+	startS  float64
+	endS    float64
+}
+
+func buildSegments(master []models.Trackpoint, corners []track.CornerDef) []segmentDef {
+	var segments []segmentDef
+	lastEnd := 0.0
+	masterLen := master[len(master)-1].S
+	for _, c := range corners {
+		if c.StartS > lastEnd {
+			segments = append(segments, segmentDef{segType: "straight", startS: lastEnd, endS: c.StartS})
+		}
+		segments = append(segments, segmentDef{segType: "corner", startS: c.StartS, endS: c.EndS})
+		lastEnd = c.EndS
+	}
+	if lastEnd < masterLen {
+		segments = append(segments, segmentDef{segType: "straight", startS: lastEnd, endS: masterLen})
+	}
+	return segments
+}
+
+func analyzeSegments(points []carPoint, master []models.Trackpoint, defs []segmentDef) ([]segmentStatOut, []segmentLapStatOut) {
+	if len(points) == 0 || len(defs) == 0 {
+		return nil, nil
+	}
+	byLap := make(map[int][]carPoint)
+	for _, p := range points {
+		byLap[p.Lap] = append(byLap[p.Lap], p)
+	}
+	out := make([]segmentStatOut, len(defs))
+	var perLap []segmentLapStatOut
+	for i, s := range defs {
+		stat := segmentStatOut{Segment: i, Type: s.segType}
+		for _, lapPts := range byLap {
+			var entry, exit, min, max, avg float64
+			min = math.MaxFloat64
+			sum := 0.0
+			count := 0
+			var tStart, tEnd float64
+			found := false
+			for _, p := range lapPts {
+				if p.RelS < s.startS {
+					continue
+				}
+				if p.RelS > s.endS {
+					break
+				}
+				if !found {
+					entry = p.SpeedMPH
+					tStart = p.Time
+					found = true
+				}
+				if p.SpeedMPH < min {
+					min = p.SpeedMPH
+				}
+				if p.SpeedMPH > max {
+					max = p.SpeedMPH
+				}
+				exit = p.SpeedMPH
+				sum += p.SpeedMPH
+				count++
+				tEnd = p.Time
+			}
+			if found && count > 0 {
+				avg = sum / float64(count)
+				stat.Count++
+				stat.EntryMPH += entry
+				stat.MinMPH += min
+				stat.ExitMPH += exit
+				stat.AvgMPH += avg
+				stat.Time += (tEnd - tStart)
+				perLap = append(perLap, segmentLapStatOut{
+					Segment:  i,
+					Lap:      lapPts[0].Lap,
+					Type:     s.segType,
+					EntryMPH: entry,
+					MinMPH:   min,
+					ExitMPH:  exit,
+					AvgMPH:   avg,
+					Time:     tEnd - tStart,
+					EntryKMH: entry * 1.60934,
+					MinKMH:   min * 1.60934,
+					ExitKMH:  exit * 1.60934,
+					AvgKMH:   avg * 1.60934,
+				})
+			}
+		}
+		if stat.Count > 0 {
+			n := float64(stat.Count)
+			stat.EntryMPH /= n
+			stat.MinMPH /= n
+			stat.ExitMPH /= n
+			stat.AvgMPH /= n
+			stat.Time /= n
+			stat.EntryKMH = stat.EntryMPH * 1.60934
+			stat.MinKMH = stat.MinMPH * 1.60934
+			stat.ExitKMH = stat.ExitMPH * 1.60934
+			stat.AvgKMH = stat.AvgMPH * 1.60934
+			out[i] = stat
+		}
+	}
+	var compact []segmentStatOut
+	for _, s := range out {
+		if s.Count > 0 {
+			compact = append(compact, s)
+		}
+	}
+	return compact, perLap
 }
 
 func LoadSamplesFromCSV(path string) ([]models.Sample, error) {

@@ -5,7 +5,11 @@ import (
 	"math"
 )
 
-// ClassifySurface labels each point as "dirt" or "asphalt" using a short sliding window.
+// ClassifySurface labels each point using available telemetry:
+// - "puddle" when wheels report water contact
+// - "rumble" when wheels report rumble strips
+// - "dirt" when lateral/heading variance and slip indicate loose surface
+// - "asphalt" otherwise
 // windowSize is number of samples (~30 => ~0.5s at 60Hz). Defaults to 30 when <=0.
 func ClassifySurface(samples []models.Sample, points []models.Trackpoint, windowSize int) []string {
 	if windowSize <= 0 {
@@ -24,9 +28,17 @@ func ClassifySurface(samples []models.Sample, points []models.Trackpoint, window
 		latVar := varianceAccelX(samples[start : i+1])
 		yawVar := varianceYaw(points[start : i+1])
 		slip := slipEstimate(samples[start : i+1])
-		if latVar > 0.8 && yawVar > 0.5 && slip > 0.2 {
+		onRumble := wheelSum(samples[i].WheelOnRumbleFL, samples[i].WheelOnRumbleFR, samples[i].WheelOnRumbleRL, samples[i].WheelOnRumbleRR) > 0.5
+		inPuddle := wheelSum(samples[i].WheelInPuddleFL, samples[i].WheelInPuddleFR, samples[i].WheelInPuddleRL, samples[i].WheelInPuddleRR) > 0.3
+
+		switch {
+		case inPuddle:
+			out[i] = "puddle"
+		case onRumble:
+			out[i] = "rumble"
+		case latVar > 0.8 && yawVar > 0.5 && slip > 0.2:
 			out[i] = "dirt"
-		} else {
+		default:
 			out[i] = "asphalt"
 		}
 	}
@@ -95,4 +107,15 @@ func slipEstimate(s []models.Sample) float64 {
 		sum += slip
 	}
 	return sum / float64(len(s)-1)
+}
+
+func wheelSum(vals ...float64) float64 {
+	var sum float64
+	for _, v := range vals {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			continue
+		}
+		sum += v
+	}
+	return sum
 }

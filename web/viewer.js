@@ -11,6 +11,7 @@
   const legendEl = document.getElementById("legend");
   const lapsEl = document.getElementById("laps");
   const eventsEl = document.getElementById("events");
+  const collapsibleHeaders = document.querySelectorAll(".collapsible");
   const deltaCanvas = document.getElementById("delta");
   const deltaCtx = deltaCanvas.getContext("2d");
   const deltaInfo = document.getElementById("deltaInfo");
@@ -18,6 +19,9 @@
   const steerCanvas = document.getElementById("steer");
   const steerCtx = steerCanvas.getContext("2d");
   const steerInfo = document.getElementById("steerInfo");
+  const cornerStatsEl = document.getElementById("cornerStats");
+  const segmentStatsEl = document.getElementById("segmentStats");
+  const segmentGhostEl = document.getElementById("segmentGhost");
   const liveEl = document.getElementById("live");
   const livePanel = document.getElementById("livePanel");
   const liveShowControls = document.getElementById("liveShowControls");
@@ -31,6 +35,7 @@
   const showLabelsLatch = document.querySelector('label[for="showLabels"]');
   const settingsEventTypes = document.getElementById("settingsEventTypes");
   const eventFilterEl = document.getElementById("eventFilter");
+  const eventPresetsEl = document.getElementById("eventPresets");
   const toastContainer = document.getElementById("toastContainer");
   const staticCanvas = document.createElement("canvas");
   const staticCtx = staticCanvas.getContext("2d");
@@ -55,15 +60,43 @@
   let notifyTypes = new Set();
   let eventTypeOrder = [];
   let sortedEvents = [];
-  const majorEvents = new Set(["crash", "collision", "reset", "drift", "traction", "overtake", "position_gain", "position_loss", "pole_gain", "pole_loss"]);
+  let lastNotifiedTime = 0;
+  let carColorMap = new Map();
+  let cornerLapExpanded = true;
+  let lastLapRendered = -1;
+  let ghostMode = false;
+  let ghostRestore = null;
+  let boundsOverride = null;
+  let freezePlayback = false;
+  let ghostState = {
+    active: false,
+    carIdx: 0,
+    lap: 0,
+    playerStart: 0,
+    playerEnd: 0,
+    ghostStart: 0,
+    ghostEnd: 0,
+  };
+  const majorEvents = new Set(["crash", "collision", "reset", "drift", "traction", "overtake", "position_gain", "position_loss", "pole_gain", "pole_loss", "early_brake", "late_brake"]);
+  // Good → Bad → Misc ordering
+  const preferredEventOrder = [
+    // Good
+    "position_gain", "pole_gain", "overtake",
+    // Bad
+    "crash", "collision", "early_brake", "late_brake", "position_loss", "pole_loss", "traction",
+    // Misc
+    "surface", "reset", "drift",
+  ];
   let debugEl = null;
   let debugEnabled = true;
   const telemetryRanges = {
     susp: { min: Infinity, max: -Infinity },
     // temps stored in °C from the backend; midLow/midHigh adjusted per unit in computeTelemetryRanges
     temp: { min: Infinity, max: -Infinity, midLow: 88, midHigh: 99 },
+    line: { min: Infinity, max: -Infinity },
   };
   let tempUnit = "c"; // c or f
+  let selectedCorner = null;
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -106,20 +139,32 @@
           const t = (ev.type || "").toLowerCase();
           if (t) types.add(t);
         });
-        eventTypeOrder = Array.from(types).sort();
-        eventTypes = new Set(eventTypeOrder);
-        notifyTypes = new Set(eventTypeOrder);
+        eventTypeOrder = sortEvents(Array.from(types));
+        const defaultTypes = new Set(["position_gain","position_loss","pole_gain","pole_loss"]);
+        eventTypes = new Set(eventTypeOrder.filter((t) => defaultTypes.has(t)));
+        notifyTypes = new Set(eventTypes);
         sortedEvents = (data.events || []).slice().filter((e) => isFinite(e.time)).sort((a, b) => a.time - b.time);
+        lastNotifiedTime = 0;
+        carColorMap = new Map();
+        (data.cars || []).forEach((car, idx) => {
+          const col = palette[idx % palette.length];
+          if (car && car.source) {
+            carColorMap.set(car.source, col);
+          }
+        });
         computeTelemetryRanges();
         buildDeltaPlayer();
         buildLegend();
         buildSettingsEventTypes();
         buildLaps();
         buildEvents();
+        buildCornerStats();
+        buildSegmentStats();
         updateLive();
         initDrag();
         initSettings();
         initLiveToggles();
+        initCollapsibles();
         initDebug();
         renderStatic();
         carCursors = new Array(data.cars?.length || 0).fill(0);
@@ -168,6 +213,29 @@
     target.addEventListener("pointerdown", onDown);
   }
 
+  function initCollapsibles() {
+    collapsibleHeaders.forEach((h) => {
+      const targetId = h.dataset.target;
+      const body = targetId ? document.getElementById(targetId) : null;
+      const chev = h.querySelector(".chev");
+      if (!body) return;
+      body.style.display = "block";
+      const setState = (open) => {
+        body.style.display = open ? "block" : "none";
+        if (chev) {
+          chev.style.transform = open ? "rotate(90deg)" : "rotate(0deg)";
+          chev.style.color = open ? "var(--accent)" : "var(--muted)";
+        }
+      };
+      let open = true;
+      setState(open);
+      h.addEventListener("click", () => {
+        open = !open;
+        setState(open);
+      });
+    });
+  }
+
   function initSettings() {
     if (!settingsBtn || !settingsOverlay) return;
     settingsBtn.addEventListener("click", () => {
@@ -189,6 +257,7 @@
         unit = e.target.value;
         settingsOverlay.style.display = "none";
         updateLive();
+        buildCornerStats();
       });
       if (r.checked) unit = r.value;
     });
@@ -289,11 +358,18 @@
   }
 
   function orient(pt) {
-    // Mirror X to correct left/right flip; Y orientation handled in projection invert.
-    return { x: -pt.x, y: pt.y };
+    // Preserve native axes: x+ right, y+ up. Y inversion handled in projection.
+    const p = { x: pt.x, y: pt.y };
+    if (boundsOverride && boundsOverride.shift) {
+      return { x: p.x + boundsOverride.shift.x, y: p.y + boundsOverride.shift.y };
+    }
+    return p;
   }
 
   function getBounds() {
+    if (boundsOverride && boundsOverride.bounds) {
+      return boundsOverride.bounds;
+    }
     const pts = data.master || [];
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     pts.forEach((p) => {
@@ -327,6 +403,7 @@
     "#ffb100", "#6bc5ff", "#ff6b6b", "#7bd389", "#f78bff", "#ffd166",
     "#7af8ff", "#c084fc", "#90e0ef", "#ff9f1c",
   ];
+  const ghostColor = "#00d8ff";
 
   function filteredCars() {
     if (selectedCar === null) return data.cars || [];
@@ -368,6 +445,16 @@
         }
       }
     });
+
+    // Ghost head
+    const ghostHead = ghostPosition();
+    if (ghostHead) {
+      const { x, y } = project({ x: ghostHead.masterX, y: ghostHead.masterY }, bounds, w, h);
+      ctx.fillStyle = ghostColor;
+      ctx.beginPath();
+      ctx.arc(x, y, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
 
   }
 
@@ -432,11 +519,31 @@
     });
     staticCtx.stroke();
 
+    // Highlight selected corner
+    if (selectedCorner !== null && data.corners && data.corners[selectedCorner]) {
+      const c = data.corners[selectedCorner];
+      const pts = data.master.filter((p) => p.relS >= c.startS && p.relS <= c.endS);
+      if (pts.length > 1) {
+        staticCtx.strokeStyle = "#ffb100";
+        staticCtx.lineWidth = 5;
+        staticCtx.beginPath();
+        pts.forEach((p, i) => {
+          const { x, y } = project(p, bounds, w, h);
+          if (i === 0) staticCtx.moveTo(x, y);
+          else staticCtx.lineTo(x, y);
+        });
+        staticCtx.stroke();
+        staticCtx.lineWidth = 2;
+      }
+    }
+
     // Events on map (optional)
     if (showEvents && data.events && data.events.length) {
+      const curLap = currentLapAtTime();
       data.events.forEach((ev) => {
         const t = (ev.type || "").toLowerCase();
         if (!eventTypes.has(t)) return;
+        if (curLap > 0 && ev.lap > 0 && ev.lap !== curLap) return;
         const pt = { x: ev.masterX ?? ev.x, y: ev.masterY ?? ev.y };
         if (!isFinite(pt.x) || !isFinite(pt.y)) return;
         const { x, y } = project(pt, bounds, w, h);
@@ -556,6 +663,7 @@
       tireTempFR: p1.tireTempFR + (p2.tireTempFR - p1.tireTempFR) * alpha,
       tireTempRL: p1.tireTempRL + (p2.tireTempRL - p1.tireTempRL) * alpha,
       tireTempRR: p1.tireTempRR + (p2.tireTempRR - p1.tireTempRR) * alpha,
+      distToLine: p1.distToLine + (p2.distToLine - p1.distToLine) * alpha,
     };
   }
 
@@ -572,6 +680,8 @@
         deltaPlayer.value = selectedCar === null ? 0 : idx;
         buildLegend();
         buildEvents();
+        buildCornerStats();
+        buildSegmentStats();
         updateLive();
         updateDelta(true);
         draw();
@@ -579,12 +689,13 @@
       legendEl.appendChild(el);
     });
     buildEventFilter();
+    buildEventPresets();
   }
 
   function buildEventFilter() {
     if (!eventFilterEl) return;
     eventFilterEl.innerHTML = "";
-    const types = eventTypeOrder.length ? eventTypeOrder : Array.from(eventTypes);
+    const types = eventTypeOrder.length ? eventTypeOrder : sortEvents(Array.from(eventTypes));
     types.forEach((t) => {
       const id = `ev-${t}`;
       const label = document.createElement("label");
@@ -608,13 +719,47 @@
     eventFilterEl.style.display = showEvents ? "flex" : "none";
   }
 
+  function buildEventPresets() {
+    if (!eventPresetsEl) return;
+    eventPresetsEl.innerHTML = "";
+    const presets = [
+      { name: "All", types: null },
+      { name: "Performance", types: ["position_gain","position_loss","pole_gain","pole_loss","overtake"] },
+      { name: "Issues", types: ["crash","collision","early_brake","late_brake","traction","surface"] },
+    ];
+    presets.forEach((p) => {
+      const btn = document.createElement("button");
+      btn.className = "event-preset";
+      btn.textContent = p.name;
+      btn.addEventListener("click", () => {
+        if (p.types === null) {
+          eventTypes = new Set(eventTypeOrder);
+          notifyTypes = new Set(eventTypes);
+        } else {
+          eventTypes = new Set(p.types.filter((t) => eventTypeOrder.includes(t)));
+          notifyTypes = new Set(eventTypes);
+        }
+        buildEventFilter();
+        buildSettingsEventTypes();
+        buildEvents();
+        renderStatic();
+        // glow feedback
+        btn.style.boxShadow = `0 0 0 2px var(--accent)`;
+        setTimeout(() => {
+          btn.style.boxShadow = "";
+        }, 300);
+      });
+      eventPresetsEl.appendChild(btn);
+    });
+  }
+
   function buildSettingsEventTypes() {
     if (!settingsEventTypes) return;
     settingsEventTypes.innerHTML = "";
     const wrapTitle = document.createElement("h4");
     wrapTitle.textContent = "Event types";
     settingsEventTypes.appendChild(wrapTitle);
-    const types = eventTypeOrder.length ? eventTypeOrder : Array.from(eventTypes);
+    const types = eventTypeOrder.length ? eventTypeOrder : sortEvents(Array.from(eventTypes));
     types.forEach((t) => {
       const col = eventColor(t);
       const tint = col || "#cdd7e1";
@@ -624,23 +769,11 @@
       cb.type = "checkbox";
       cb.checked = eventTypes.has(t);
       lbl.classList.toggle("active", cb.checked);
-      if (cb.checked) {
-        lbl.style.borderColor = `${tint}88`;
-        lbl.style.boxShadow = `0 0 0 2px ${tint}33`;
-        lbl.style.background = `linear-gradient(135deg, ${tint}26, ${tint}12)`;
-      }
+      applyEventToggleStyle(lbl, cb.checked, tint);
       cb.addEventListener("change", (e) => {
         if (e.target.checked) eventTypes.add(t); else eventTypes.delete(t);
         lbl.classList.toggle("active", e.target.checked);
-        if (e.target.checked) {
-          lbl.style.borderColor = `${tint}88`;
-          lbl.style.boxShadow = `0 0 0 2px ${tint}33`;
-          lbl.style.background = `linear-gradient(135deg, ${tint}26, ${tint}12)`;
-        } else {
-          lbl.style.borderColor = "";
-          lbl.style.boxShadow = "";
-          lbl.style.background = "";
-        }
+        applyEventToggleStyle(lbl, e.target.checked, tint);
         buildEvents();
         renderStatic();
         draw();
@@ -654,7 +787,7 @@
       const text = document.createElement("span");
       text.className = "pill-label";
       text.textContent = t;
-      text.style.color = tint;
+      text.style.color = cb.checked ? tint : "";
       lbl.appendChild(cb);
       lbl.appendChild(dot);
       lbl.appendChild(text);
@@ -664,6 +797,156 @@
 
   function rebuildNotificationTypes() {
     notifyTypes = new Set(eventTypes);
+  }
+
+  function sortEvents(list) {
+    const order = new Map();
+    preferredEventOrder.forEach((t, idx) => order.set(t, idx));
+    return list.sort((a, b) => {
+      const ia = order.has(a) ? order.get(a) : preferredEventOrder.length + a.localeCompare(b);
+      const ib = order.has(b) ? order.get(b) : preferredEventOrder.length + b.localeCompare(a);
+      return ia - ib;
+    });
+  }
+
+  function applyEventToggleStyle(lbl, active, tint) {
+    if (active) {
+      lbl.style.borderColor = `${tint}cc`;
+      lbl.style.boxShadow = `0 0 0 2px ${tint}33`;
+      lbl.style.background = `linear-gradient(135deg, ${tint}26, ${tint}0f)`;
+    } else {
+      lbl.style.borderColor = "";
+      lbl.style.boxShadow = "";
+      lbl.style.background = "";
+    }
+  }
+
+  function currentLapAtTime() {
+    const cars = data?.cars || [];
+    const idx = selectedCar !== null ? selectedCar : 0;
+    const car = cars[idx];
+    if (!car || !car.points || !car.points.length) return 0;
+    const head = positionAtTime(car.points, currentTime);
+    if (head && isFinite(head.lap)) return head.lap;
+    return 0;
+  }
+
+  function ghostPosition() {
+    if (!ghostState.active) return null;
+    const cars = data?.cars || [];
+    const car = cars[ghostState.carIdx];
+    if (!car || !car.points || !car.points.length) return null;
+    const lapPts = car.points.filter((p) => p.lap === ghostState.lap);
+    if (!lapPts.length) return null;
+    const prog = clamp((currentTime - ghostState.playerStart) / (ghostState.playerEnd - ghostState.playerStart), 0, 1);
+    const t = ghostState.ghostStart + prog*(ghostState.ghostEnd - ghostState.ghostStart);
+    return positionAtTime(lapPts, t);
+  }
+
+  function stopGhost() {
+    ghostMode = false;
+    ghostState.active = false;
+    freezePlayback = false;
+    if (ghostRestore) {
+      boundsOverride = ghostRestore.bounds || null;
+      currentTime = ghostRestore.time;
+      playing = ghostRestore.playing;
+      ghostRestore = null;
+      lastTs = performance.now();
+      renderStatic();
+      draw();
+    }
+    // no auto-toggle; leave advanced as user set it
+  }
+
+  function clamp(v, lo, hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+  }
+
+  function playSegmentGhost(carIdx, segIdx, lapNum) {
+    const cars = data?.cars || [];
+    const car = cars[carIdx];
+    const seg = data?.segments?.[segIdx];
+    if (!car || !seg || !car.points || !car.points.length) return;
+    // focus on chosen car
+    selectedCar = carIdx;
+    if (deltaPlayer) deltaPlayer.value = carIdx;
+    const playerWindow = segmentWindow(carIdx, lapNum, seg);
+    if (!playerWindow) return;
+
+    // Find best segment across all cars/laps by time
+    let best = { carIdx, lap: lapNum, time: playerWindow.end - playerWindow.start, window: playerWindow };
+    (cars || []).forEach((c, idx) => {
+      (c.segmentsLap || []).forEach((s) => {
+        if (s.segment !== segIdx || !isFinite(s.time) || s.time <= 0) return;
+        if (s.time < best.time) {
+          const win = segmentWindow(idx, s.lap, seg);
+          if (win) {
+            best = { carIdx: idx, lap: s.lap, time: s.time, window: win };
+          }
+        }
+      });
+    });
+
+    ghostRestore = { time: currentTime, bounds: boundsOverride, playing: playing };
+    boundsOverride = segmentBounds(seg);
+    ghostState = {
+      active: true,
+      carIdx: best.carIdx,
+      lap: best.lap,
+      playerStart: playerWindow.start,
+      playerEnd: playerWindow.end,
+      ghostStart: best.window.start,
+      ghostEnd: best.window.end,
+    };
+    ghostMode = true;
+    freezePlayback = false;
+    playing = true;
+    currentTime = playerWindow.start;
+    lastTs = performance.now();
+    renderStatic();
+    if (window.innerWidth <= 900) {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+    requestAnimationFrame(tick);
+  }
+
+  function segmentWindow(carIdx, lapNum, seg) {
+    const cars = data?.cars || [];
+    const car = cars[carIdx];
+    if (!car || !seg || !car.points || !car.points.length) return null;
+    let startTime = null, endTime = null;
+    car.points.forEach((p) => {
+      if (p.lap !== lapNum) return;
+      if (startTime === null && p.relS >= seg.startS) {
+        startTime = p.time;
+      }
+      if (p.relS <= seg.endS) {
+        endTime = p.time;
+      }
+    });
+    if (startTime === null || endTime === null || endTime <= startTime) return null;
+    return { start: startTime, end: endTime };
+  }
+
+  function segmentBounds(seg) {
+    if (!seg || !data || !data.master) return null;
+    const pts = (data.master || []).filter((p) => p.relS >= seg.startS && p.relS <= seg.endS);
+    if (!pts.length) return null;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    pts.forEach((p) => {
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x);
+      maxY = Math.max(maxY, p.y);
+    });
+    const pad = 50;
+    return {
+      bounds: { minX: minX - pad, minY: minY - pad, maxX: maxX + pad, maxY: maxY + pad },
+      shift: { x: 0, y: 0 },
+    };
   }
 
   function ms(x) { return (x * 1000).toFixed(0); }
@@ -677,20 +960,25 @@
   }
 
   function notifyEvent(ev) {
+    if (ghostState.active) return; // suppress toasts during ghost playback
     const ttype = (ev.type || "").toLowerCase();
     if (!toastContainer || !ev || !majorEvents.has(ttype) || (notifyTypes.size && !notifyTypes.has(ttype))) return;
     const el = document.createElement("div");
     el.className = "toast";
-    const type = (ev.type || "event").replace(/_/g, " ").toUpperCase();
-    const note = ev.note || "";
-    const src = (ev.source || ev.target || "").split("/").pop();
+    const title = (ev.source || ev.target || "").split("/").pop() || "Event";
+    const carColor = colorForSource(ev.source || ev.target);
+    const body = prettyToastBody(ttype, ev);
     const lap = ev.lap ?? "?";
     const t = isFinite(ev.time) ? ev.time.toFixed(2) : "?";
     el.innerHTML = `
-      <div class="toast-type">${src ? `${src}: ${type}` : type}</div>
-      <div class="toast-note">${note}</div>
+      <div class="toast-type" style="${carColor ? `color:${carColor}` : ""}">${title}</div>
+      <div class="toast-note">${body}</div>
       <div class="toast-meta">t=${t}s · lap ${lap}</div>
     `;
+    if (carColor) {
+      el.style.borderColor = `${carColor}88`;
+      el.style.boxShadow = `0 0 0 2px ${carColor}22`;
+    }
     el.addEventListener("click", () => el.remove());
     toastContainer.appendChild(el);
     setTimeout(() => el.remove(), 4200);
@@ -726,6 +1014,38 @@
     // Only show if fairly recent (e.g., within 5s)
     if (isFinite(best.time) && t - best.time > 5) return "";
     return best.type;
+  }
+
+  function colorForSource(src) {
+    if (!src) return "";
+    if (carColorMap.has(src)) return carColorMap.get(src);
+    const cars = data?.cars || [];
+    const idx = cars.findIndex((c) => c && c.source === src);
+    if (idx >= 0) return palette[idx % palette.length];
+    return "";
+  }
+
+  function prettyToastBody(ttype, ev) {
+    switch (ttype) {
+      case "collision": return "💥 Collision!";
+      case "early_brake": return "🐢 Early Brake";
+      case "late_brake": return "🚀 Late Brake";
+      case "pole_gain": return "🏁⬆️ Took Pole Position";
+      case "pole_loss": return "🏁⬇️ Lost Pole Position";
+      case "position_gain": {
+        const pos = isFinite(ev.racePosition) ? ` P${ev.racePosition}` : "";
+        return `📈 Position +1${pos}`;
+      }
+      case "position_loss": {
+        const pos = isFinite(ev.racePosition) ? ` P${ev.racePosition}` : "";
+        return `📉 Position -1${pos}`;
+      }
+      case "surface": return "🌍 Surface Change";
+      case "traction": return "🌀 Traction Loss";
+      case "overtake": return "⚡ Overtake";
+      default:
+        return (ev.note || (ev.type || "event")).replace(/^./, (c) => c.toUpperCase());
+    }
   }
 
   function buildLaps() {
@@ -770,6 +1090,134 @@
     });
   }
 
+  function buildCornerStats() {
+    if (!cornerStatsEl) return;
+    cornerStatsEl.innerHTML = "";
+    if (!data || !data.corners || !data.corners.length) {
+      cornerStatsEl.textContent = "No corners detected";
+      cornerStatsEl.style.color = "#888";
+      return;
+    }
+    const car = selectedCar !== null ? (data.cars || [])[selectedCar] : (data.cars || [])[0];
+    if (!car || !car.corners || !car.corners.length) {
+      cornerStatsEl.textContent = "No corner stats for this car";
+      cornerStatsEl.style.color = "#888";
+      return;
+    }
+    cornerStatsEl.style.color = "";
+    const wrap = document.createElement("div");
+    wrap.className = "table-wrap";
+    const table = document.createElement("table");
+    const head = document.createElement("tr");
+    head.innerHTML = "<th>#</th><th>Dir</th><th>Angle</th><th>Entry</th><th>Min</th><th>Exit</th>";
+    table.appendChild(head);
+    const statsByCorner = new Map();
+    car.corners.forEach((c) => statsByCorner.set(c.corner, c));
+    data.corners.forEach((c) => {
+      const stat = statsByCorner.get(c.index);
+      const dir = c.direction || "";
+      const angle = isFinite(c.angleDeg) ? `${c.angleDeg.toFixed(1)}°` : "";
+      const unitLabel = unit === "kmh" ? "km/h" : "mph";
+      const entry = stat ? (unit === "kmh" ? stat.entryKMH : stat.entryMPH) : NaN;
+      const min = stat ? (unit === "kmh" ? stat.minKMH : stat.minMPH) : NaN;
+      const exit = stat ? (unit === "kmh" ? stat.exitKMH : stat.exitMPH) : NaN;
+      const row = document.createElement("tr");
+      row.style.cursor = "pointer";
+      if (selectedCorner === c.index) {
+        row.style.background = "rgba(255,177,0,0.12)";
+      }
+      row.innerHTML = `
+        <td>${c.index + 1}</td>
+        <td>${dir}</td>
+        <td>${angle}</td>
+        <td>${isFinite(entry) ? entry.toFixed(1) : "--"} ${unitLabel}</td>
+        <td>${isFinite(min) ? min.toFixed(1) : "--"} ${unitLabel}</td>
+        <td>${isFinite(exit) ? exit.toFixed(1) : "--"} ${unitLabel}</td>
+      `;
+      row.addEventListener("click", () => {
+        selectedCorner = selectedCorner === c.index ? null : c.index;
+        buildCornerStats();
+        renderStatic();
+        draw();
+      });
+      table.appendChild(row);
+    });
+    wrap.appendChild(table);
+    cornerStatsEl.appendChild(wrap);
+
+    // Per-lap table
+    if (car.cornersLap && car.cornersLap.length) {
+      const subhead = document.createElement("h4");
+      subhead.className = "collapsible";
+      subhead.dataset.target = "cornerLapSection";
+      subhead.style.margin = "8px 0 4px";
+      subhead.style.color = "var(--muted)";
+      subhead.style.fontSize = "14px";
+      subhead.style.display = "flex";
+      subhead.style.alignItems = "center";
+      subhead.style.justifyContent = "space-between";
+      subhead.style.width = "100%";
+      const labelSpan = document.createElement("span");
+      labelSpan.textContent = "Per-lap (selected car)";
+      labelSpan.style.color = "var(--muted)";
+      labelSpan.style.flex = "1";
+      const chevron = document.createElement("span");
+      chevron.className = "chev";
+      chevron.textContent = "›";
+      subhead.appendChild(labelSpan);
+      subhead.appendChild(chevron);
+      const wrap2 = document.createElement("div");
+      wrap2.id = "cornerLapSection";
+      wrap2.className = "table-wrap";
+      const table2 = document.createElement("table");
+      table2.style.marginTop = "0";
+      const head2 = document.createElement("tr");
+      head2.innerHTML = "<th>Lap</th><th>Corner</th><th>Entry</th><th>Min</th><th>Exit</th>";
+      table2.appendChild(head2);
+      const unitLabel2 = unit === "kmh" ? "km/h" : "mph";
+      // sort by lap then corner
+      const sorted = [...car.cornersLap].sort((a, b) => a.lap - b.lap || a.corner - b.corner);
+      sorted.forEach((s) => {
+        const entry = unit === "kmh" ? s.entryKMH : s.entryMPH;
+        const min = unit === "kmh" ? s.minKMH : s.minMPH;
+        const exit = unit === "kmh" ? s.exitKMH : s.exitMPH;
+        const row = document.createElement("tr");
+        if (selectedCorner === s.corner) {
+          row.style.background = "rgba(255,177,0,0.12)";
+        }
+        row.innerHTML = `
+          <td>${s.lap}</td>
+          <td>${s.corner + 1}</td>
+          <td>${isFinite(entry) ? entry.toFixed(1) : "--"} ${unitLabel2}</td>
+          <td>${isFinite(min) ? min.toFixed(1) : "--"} ${unitLabel2}</td>
+          <td>${isFinite(exit) ? exit.toFixed(1) : "--"} ${unitLabel2}</td>
+        `;
+        row.addEventListener("click", (e) => {
+          e.stopPropagation();
+          selectedCorner = selectedCorner === s.corner ? null : s.corner;
+          buildCornerStats();
+          renderStatic();
+          draw();
+        });
+        table2.appendChild(row);
+      });
+      wrap2.appendChild(table2);
+      let expanded = cornerLapExpanded;
+      wrap2.style.display = expanded ? "block" : "none";
+      chevron.style.transform = expanded ? "rotate(90deg)" : "rotate(0deg)";
+      chevron.style.color = expanded ? "var(--accent)" : "var(--muted)";
+      subhead.addEventListener("click", () => {
+        expanded = !expanded;
+        cornerLapExpanded = expanded;
+        wrap2.style.display = expanded ? "block" : "none";
+        chevron.style.transform = expanded ? "rotate(90deg)" : "rotate(0deg)";
+        chevron.style.color = expanded ? "var(--accent)" : "var(--muted)";
+      });
+      cornerStatsEl.appendChild(subhead);
+      cornerStatsEl.appendChild(wrap2);
+    }
+  }
+
   function buildDeltaPlayer() {
     deltaPlayer.innerHTML = "";
     (data.cars || []).forEach((car, idx) => {
@@ -781,15 +1229,17 @@
     if (selectedCar !== null) {
       deltaPlayer.value = selectedCar;
     }
-    deltaPlayer.addEventListener("change", () => {
-      selectedCar = parseInt(deltaPlayer.value, 10);
-      buildLegend();
-      buildEvents();
-      updateLive();
-      updateDelta();
-      updateSteering();
-      draw();
-    });
+  deltaPlayer.addEventListener("change", () => {
+    selectedCar = parseInt(deltaPlayer.value, 10);
+    buildLegend();
+    buildEvents();
+    buildCornerStats();
+    buildSegmentStats();
+    updateLive();
+    updateDelta();
+    updateSteering();
+    draw();
+  });
   }
 
   function deltaClass(d) {
@@ -814,17 +1264,21 @@
       case "position_loss": return "#ff6b6b";
       case "pole_gain": return "#00c2ff";
       case "pole_loss": return "#ff6b6b";
+      case "early_brake": return "#6bc5ff";
+      case "late_brake": return "#ff9f1c";
       default: return "#cdd7e1";
     }
   }
 
   function buildEvents() {
     eventsEl.innerHTML = "";
+    const curLap = currentLapAtTime();
     const list = (data.events || []).filter((ev) => {
       if (selectedCar !== null) {
         const car = (data.cars || [])[selectedCar];
         if (car && ev.source !== car.source && ev.target !== car.source) return false;
       }
+      if (curLap > 0 && ev.lap > 0 && ev.lap !== curLap) return false;
       if (!eventTypes.has((ev.type || "").toLowerCase())) return false;
       return true;
     });
@@ -850,6 +1304,101 @@
     });
   }
 
+  function buildSegmentStats() {
+    if (!segmentStatsEl) return;
+    segmentStatsEl.innerHTML = "";
+    if (!data || !data.segments || !data.segments.length) {
+      segmentStatsEl.textContent = "No segments detected";
+      segmentStatsEl.style.color = "#888";
+      return;
+    }
+    const car = selectedCar !== null ? (data.cars || [])[selectedCar] : (data.cars || [])[0];
+    if (!car || !car.segments || !car.segments.length) {
+      segmentStatsEl.textContent = "No segment stats for this car";
+      segmentStatsEl.style.color = "#888";
+      return;
+    }
+    segmentStatsEl.style.color = "";
+    const wrap = document.createElement("div");
+    wrap.className = "table-wrap";
+    const table = document.createElement("table");
+    const head = document.createElement("tr");
+    head.innerHTML = "<th>#</th><th>Type</th><th>Entry</th><th>Min</th><th>Avg</th><th>Exit</th><th>Time</th>";
+    table.appendChild(head);
+    const statsBySeg = new Map();
+    car.segments.forEach((s) => statsBySeg.set(s.segment, s));
+    const unitLabel = unit === "kmh" ? "km/h" : "mph";
+    data.segments.forEach((s, idx) => {
+      const stat = statsBySeg.get(idx);
+      const row = document.createElement("tr");
+      row.innerHTML = `
+        <td>${idx + 1}</td>
+        <td>${s.type}</td>
+        <td>${stat ? (unit === "kmh" ? stat.entryKMH : stat.entryMPH).toFixed(1) : "--"} ${unitLabel}</td>
+        <td>${stat ? (unit === "kmh" ? stat.minKMH : stat.minMPH).toFixed(1) : "--"} ${unitLabel}</td>
+        <td>${stat ? (unit === "kmh" ? stat.avgKMH : stat.avgMPH).toFixed(1) : "--"} ${unitLabel}</td>
+        <td>${stat ? (unit === "kmh" ? stat.exitKMH : stat.exitMPH).toFixed(1) : "--"} ${unitLabel}</td>
+        <td>${stat && isFinite(stat.time) ? stat.time.toFixed(2) : "--"} s</td>
+      `;
+      table.appendChild(row);
+    });
+    wrap.appendChild(table);
+    segmentStatsEl.appendChild(wrap);
+    buildSegmentGhostControls();
+  }
+
+  function buildSegmentGhostControls() {
+    if (!segmentGhostEl) return;
+    segmentGhostEl.innerHTML = "";
+    const cars = data?.cars || [];
+    if (!cars.length) return;
+    const carSel = document.createElement("select");
+    cars.forEach((c, idx) => {
+      const opt = document.createElement("option");
+      opt.value = idx;
+      opt.textContent = c.source || `Car ${idx + 1}`;
+      if (selectedCar === null && idx === 0) opt.selected = true;
+      if (selectedCar === idx) opt.selected = true;
+      carSel.appendChild(opt);
+    });
+    const segSel = document.createElement("select");
+    (data.segments || []).forEach((s, idx) => {
+      const opt = document.createElement("option");
+      opt.value = idx;
+      opt.textContent = `Segment ${idx + 1} (${s.type})`;
+      segSel.appendChild(opt);
+    });
+    const lapSel = document.createElement("select");
+    const fillLaps = () => {
+      lapSel.innerHTML = "";
+      const carIdx = parseInt(carSel.value, 10);
+      const car = cars[carIdx];
+      const laps = new Set();
+      (car.points || []).forEach((p) => laps.add(p.lap));
+      Array.from(laps).sort((a, b) => a - b).forEach((l) => {
+        const opt = document.createElement("option");
+        opt.value = l;
+        opt.textContent = `Lap ${l}`;
+        lapSel.appendChild(opt);
+      });
+    };
+    fillLaps();
+    carSel.addEventListener("change", fillLaps);
+    const btn = document.createElement("button");
+    btn.textContent = "Play segment ghost";
+    btn.style.marginTop = "6px";
+    btn.addEventListener("click", () => {
+      const carIdx = parseInt(carSel.value, 10);
+      const segIdx = parseInt(segSel.value, 10);
+      const lapNum = parseInt(lapSel.value, 10);
+      playSegmentGhost(carIdx, segIdx, lapNum);
+    });
+    segmentGhostEl.appendChild(carSel);
+    segmentGhostEl.appendChild(segSel);
+    segmentGhostEl.appendChild(lapSel);
+    segmentGhostEl.appendChild(btn);
+  }
+
   fetchData();
 
   function computeMaxTime() {
@@ -868,8 +1417,20 @@
     currentTime = Math.min(Math.max(0, t), maxTime || 0);
     scrub.value = currentTime;
     timeLabel.textContent = fmt(currentTime);
-    if (playing && currentTime > prev) {
-      checkNotifications(prev, currentTime);
+    if (currentTime > prev) {
+      checkNotifications(lastNotifiedTime, currentTime);
+      lastNotifiedTime = currentTime;
+    } else {
+      lastNotifiedTime = currentTime;
+    }
+    const curLap = currentLapAtTime();
+    if (curLap !== lastLapRendered) {
+      lastLapRendered = curLap;
+      buildEvents();
+      renderStatic();
+    }
+    if (ghostMode && ghostState.active && currentTime >= ghostState.playerEnd) {
+      stopGhost();
     }
     updateHUD(true);
     draw();
@@ -909,7 +1470,7 @@
   }
 
   function tick(ts) {
-    if (!playing) return;
+    if (!playing && !ghostState.active) return;
     const elapsed = ts - lastTs;
     if (elapsed < frameCapMs) {
       requestAnimationFrame(tick);
@@ -917,8 +1478,9 @@
     }
     lastTs = ts;
     const dt = (elapsed / 1000) * playbackRate;
-    updateTime(currentTime + dt);
-    if (currentTime >= maxTime) {
+    const nextTime = freezePlayback ? currentTime : currentTime + dt;
+    updateTime(nextTime);
+    if (currentTime >= maxTime && !freezePlayback) {
       playing = false;
       playBtn.textContent = "Play";
       return;
@@ -1154,6 +1716,7 @@
       const latG = head && isFinite(head.latAcc) ? head.latAcc / 9.81 : null;
       const longG = head && isFinite(head.longAcc) ? head.longAcc / 9.81 : null;
       const yaw = head && isFinite(head.yawRate) ? head.yawRate * (180 / Math.PI) : null;
+      const lineDev = head && isFinite(head.distToLine) ? head.distToLine : null;
       const susp = head ? [head.suspFL, head.suspFR, head.suspRL, head.suspRR] : [];
       const tempsRaw = head ? [head.tireTempFL, head.tireTempFR, head.tireTempRL, head.tireTempRR] : [];
       const temps = tempsRaw.map((v) => {
@@ -1184,21 +1747,69 @@
       liveEl.appendChild(label);
 
       // Controls / dynamics meters
-      const shouldShowAdvanced = showControls || selectedCar !== null;
+      const shouldShowAdvanced = showControls;
       if (shouldShowAdvanced) {
         liveEl.appendChild(makeMeter("Throttle", throttle, "#5dd39e"));
         liveEl.appendChild(makeMeter("Brake", brake, "#ff6b6b"));
       }
 
-      const dynamics = document.createElement("div");
-      dynamics.className = "live-row";
-      const dynLabel = document.createElement("span");
-      dynLabel.textContent = "Lat/Long/Yaw";
-      const dynVals = document.createElement("span");
-      dynVals.textContent = `${latG !== null ? latG.toFixed(2) : "--"}g / ${longG !== null ? longG.toFixed(2) : "--"}g / ${yaw !== null ? yaw.toFixed(1) : "--"}°/s`;
-      dynamics.appendChild(dynLabel);
-      dynamics.appendChild(dynVals);
-      liveEl.appendChild(dynamics);
+      if (shouldShowAdvanced) {
+        const dynamics = document.createElement("div");
+        dynamics.className = "live-row";
+        const dynLabel = document.createElement("span");
+        dynLabel.textContent = "Lat/Long/Yaw";
+        const dynVals = document.createElement("span");
+        dynVals.textContent = `${latG !== null ? latG.toFixed(2) : "--"}g / ${longG !== null ? longG.toFixed(2) : "--"}g / ${yaw !== null ? yaw.toFixed(1) : "--"}°/s`;
+        dynamics.appendChild(dynLabel);
+        dynamics.appendChild(dynVals);
+        liveEl.appendChild(dynamics);
+      }
+
+      if (shouldShowAdvanced && lineDev !== null) {
+        const lineRow = document.createElement("div");
+        lineRow.className = "live-row";
+        const l1 = document.createElement("span");
+        l1.textContent = "Line deviation";
+        const l2 = document.createElement("span");
+        const maxAbs = telemetryRanges.line.maxAbs || 0;
+        const pct = maxAbs > 0 ? Math.max(-100, Math.min(100, (lineDev / maxAbs) * 100)) : 0;
+        l2.textContent = `${pct.toFixed(0)}%`;
+        lineRow.appendChild(l1);
+        lineRow.appendChild(l2);
+        liveEl.appendChild(lineRow);
+
+        // simple bar showing left/right offset (-100..100)
+        const barWrap = document.createElement("div");
+        barWrap.className = "meter";
+        const bar = document.createElement("div");
+        bar.className = "meter-bar";
+        bar.style.position = "relative";
+        const mid = document.createElement("div");
+        mid.style.position = "absolute";
+        mid.style.left = "50%";
+        mid.style.top = "0";
+        mid.style.bottom = "0";
+        mid.style.width = "1px";
+        mid.style.background = "rgba(255,255,255,0.4)";
+        const fill = document.createElement("div");
+        fill.className = "meter-fill";
+        fill.style.background = pct >= 0 ? "#5dd39e" : "#ff6b6b";
+        const pctAbs = Math.min(100, Math.abs(pct));
+        if (pct >= 0) {
+          fill.style.left = "50%";
+          fill.style.width = `${pctAbs / 2}%`;
+        } else {
+          fill.style.left = `${50 - pctAbs / 2}%`;
+          fill.style.width = `${pctAbs / 2}%`;
+        }
+        fill.style.position = "absolute";
+        fill.style.top = "0";
+        fill.style.bottom = "0";
+        bar.appendChild(fill);
+        bar.appendChild(mid);
+        barWrap.appendChild(bar);
+        liveEl.appendChild(barWrap);
+      }
 
       // Suspension grid
       if (shouldShowAdvanced && susp.length === 4) {
@@ -1278,8 +1889,8 @@
   }
 
   function computeTelemetryRanges() {
-    telemetryRanges.susp.min = telemetryRanges.temp.min = Infinity;
-    telemetryRanges.susp.max = telemetryRanges.temp.max = -Infinity;
+    telemetryRanges.susp.min = telemetryRanges.temp.min = telemetryRanges.line.min = Infinity;
+    telemetryRanges.susp.max = telemetryRanges.temp.max = telemetryRanges.line.max = -Infinity;
     // Ideal slick temps in current unit.
     const idealLowC = 88, idealHighC = 99;
     const idealLow = tempUnit === "f" ? idealLowC * 9/5 + 32 : idealLowC;
@@ -1306,6 +1917,10 @@
             telemetryRanges.temp.max = Math.max(telemetryRanges.temp.max, v);
           }
         });
+        if (isFinite(p.distToLine)) {
+          telemetryRanges.line.min = Math.min(telemetryRanges.line.min, p.distToLine);
+          telemetryRanges.line.max = Math.max(telemetryRanges.line.max, p.distToLine);
+        }
       });
     });
     if (!isFinite(telemetryRanges.susp.min) || !isFinite(telemetryRanges.susp.max)) {
@@ -1315,6 +1930,10 @@
       telemetryRanges.temp.min = idealLow - pad;
       telemetryRanges.temp.max = idealHigh + pad;
     }
+    if (!isFinite(telemetryRanges.line.min) || !isFinite(telemetryRanges.line.max)) {
+      telemetryRanges.line.min = 0; telemetryRanges.line.max = 0;
+    }
+    telemetryRanges.line.maxAbs = Math.max(Math.abs(telemetryRanges.line.min), Math.abs(telemetryRanges.line.max));
     // Ensure temp range covers ideal slick window.
     telemetryRanges.temp.min = Math.min(telemetryRanges.temp.min, telemetryRanges.temp.midLow - pad);
     telemetryRanges.temp.max = Math.max(telemetryRanges.temp.max, telemetryRanges.temp.midHigh + pad);
